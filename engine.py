@@ -45,8 +45,34 @@ PHOTO_EXT = {".jpg", ".jpeg", ".jpe", ".heic", ".heif", ".hif", ".png", ".tif", 
              ".gif", ".bmp", ".avif", ".jxl"}
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".avi", ".mts", ".m2ts", ".mkv", ".3gp", ".mpg", ".mpeg",
              ".wmv", ".insv", ".360", ".lrv"}
+MUSIC_EXT = {".mp3", ".flac", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wma", ".wav", ".aiff",
+             ".aif", ".alac", ".ape", ".wv", ".mka", ".dsf", ".dff", ".mpc"}
+DOC_GROUPS = {
+    "PDFs": {".pdf"},
+    "Word & Text": {".doc", ".docx", ".odt", ".rtf", ".pages", ".txt", ".md", ".wpd"},
+    "Spreadsheets": {".xls", ".xlsx", ".xlsm", ".ods", ".csv", ".numbers"},
+    "Presentations": {".ppt", ".pptx", ".odp", ".key"},
+    "Ebooks": {".epub", ".mobi", ".azw", ".azw3", ".fb2", ".djvu"},
+}
+DOC_EXT = set().union(*DOC_GROUPS.values())
 # travel with the file they belong to (same name), never sorted on their own
 SIDECAR_EXT = {".xmp", ".thm", ".aae", ".pp3", ".dop", ".on1"}
+# never copied, even with "Everything else" on
+JUNK_EXT = {".tmp", ".lnk", ".ini", ".db", ".ctg", ".bdm", ".cpi", ".mpl", ".bnp", ".ind", ".inp",
+            ".log", ".dat", ".sys", ".lck", ".part", PART_SUFFIX}
+
+# folders that mean "this came off a camera"
+CAMERA_DIRS = {"DCIM", "AVCHD", "PRIVATE", "M4ROOT", "MP_ROOT", "CLIP", "STREAM", "XDROOT", "BDMV",
+               "100MEDIA"}
+# file names cameras and phones give their videos
+CAMERA_NAME_RE = re.compile(
+    r"^(DSC|DSCF|DSCN|_DSC|MVI_|MOV_?\d|M2U\d|MAH\d|MAQ\d|C\d{4}|GOPR|G[HXPL]\d|DJI_|PXL_|VID_?\d|"
+    r"VID_|IMG_|P\d{7}|PICT|HPIM|CIMG|SAM_|SDC|PANA|MP4_|LRV_|\d{5}\.MTS$|\d{5}\.M2TS$|"
+    r"\d{8}_\d{6}|VIDEO\d|CLIP\d|MAX_|INSTA|LRV)", re.I)
+# pictures that are album covers when they sit next to music
+ART_STEMS = {"cover", "folder", "front", "back", "albumart", "albumartsmall", "album", "artwork"}
+
+LIB = {"photo": "Photos", "video": "Videos", "music": "Music", "doc": "Documents", "other": "Other"}
 
 SKIP_DIRS = {"system volume information", "$recycle.bin", ".trashes", ".spotlight-v100",
              ".fseventsd", ".temporaryitems", META_NAME}
@@ -62,12 +88,31 @@ MONTHS = ["January", "February", "March", "April", "May", "June", "July", "Augus
           "October", "November", "December"]
 UNDATED = "Undated"
 
+RAW_SPLIT = {
+    "together": "RAW and JPEG together",
+    "split": "RAW and JPEG in separate RAW / JPEG folders",
+}
+CAMERA_VIDEOS = {
+    "photos_sub": "With their photos, in a Videos folder   (Photos \\ 2019 \\ 07 - July \\ Videos)",
+    "photos_mixed": "With their photos, mixed in   (Photos \\ 2019 \\ 07 - July)",
+    "videos": "In the Videos folder by date   (Videos \\ 2019 \\ 07 - July)",
+}
+OTHER_VIDEOS = {
+    "by_date": "Videos folder by date   (Videos \\ 2019 \\ 07 - July)",
+    "flat": "Videos folder, all together   (Videos)",
+}
+
 DEFAULT_SETTINGS = {
     "destination": "",
     "layout": "year_month",
-    "raw": True,
-    "photos": True,
+    "photos": True,               # photos and RAW
     "videos": True,
+    "music": True,
+    "docs": False,
+    "other": False,
+    "raw_split": "together",
+    "camera_videos": "photos_sub",
+    "other_videos": "by_date",
     "no_date": "file_date",       # or "undated"
     "auto_start": False,
     "check_updates": True,
@@ -109,28 +154,41 @@ def log_error(where: str, e: BaseException | str) -> None:
 # --------------------------------------------------------------------------- #
 # Finding files
 # --------------------------------------------------------------------------- #
-def kinds_from_settings(s: dict) -> set[str]:
-    exts: set[str] = set()
-    if s.get("raw", True):
-        exts |= RAW_EXT
-    if s.get("photos", True):
-        exts |= PHOTO_EXT
-    if s.get("videos", True):
-        exts |= VIDEO_EXT
-    return exts
-
-
 @dataclass
 class Item:
     src: Path
     size: int
+    kind: str = ""                 # raw, photo, video, music, art, doc, other
+    camera: bool = False           # videos: came off a camera or phone
     sidecars: list[Path] = field(default_factory=list)
     taken: datetime | None = None
     date_source: str = ""          # "photo", "video", "file date", "none"
+    artist: str = ""
+    album: str = ""
     folder: str = ""               # relative folder on the destination
     status: str = "Waiting"
     dest: str = ""                 # where it ended up (or the existing copy, for duplicates)
     note: str = ""
+
+
+def kind_of(ext: str) -> str:
+    if ext in RAW_EXT:
+        return "raw"
+    if ext in PHOTO_EXT:
+        return "photo"
+    if ext in VIDEO_EXT:
+        return "video"
+    if ext in MUSIC_EXT:
+        return "music"
+    if ext in DOC_EXT:
+        return "doc"
+    return "other"
+
+
+def wanted(kind: str, s: dict) -> bool:
+    return {"raw": s.get("photos", True), "photo": s.get("photos", True), "video": s.get("videos", True),
+            "music": s.get("music", True), "art": s.get("music", True), "doc": s.get("docs", False),
+            "other": s.get("other", False)}[kind]
 
 
 def _inside(p: Path, root: Path | None) -> bool:
@@ -143,7 +201,7 @@ def _inside(p: Path, root: Path | None) -> bool:
         return False
 
 
-def gather(paths: list[Path], exts: set[str], dest_root: Path | None = None, cancel=lambda: False):
+def gather(paths: list[Path], settings: dict, dest_root: Path | None = None, cancel=lambda: False):
     """Yield Items for every wanted file under the given files/folders. Sidecars (.xmp etc.) are
     attached to the file they belong to. Anything already inside the destination is skipped."""
     seen: set[str] = set()
@@ -172,22 +230,35 @@ def gather(paths: list[Path], exts: set[str], dest_root: Path | None = None, can
         for d, names, listing in dirs:
             cars_by_key: dict[str, list[str]] = {}
             stems_with_raw: set[str] = set()
+            has_music = has_camera_photo = False
             for n in listing:
                 low = n.lower()
-                ext = os.path.splitext(low)[1]
+                stem, ext = os.path.splitext(low)
                 if ext in SIDECAR_EXT:
                     # IMG_1.xmp belongs to IMG_1.*, IMG_1.CR2.xmp belongs to IMG_1.CR2
-                    cars_by_key.setdefault(os.path.splitext(low)[0], []).append(n)
+                    cars_by_key.setdefault(stem, []).append(n)
                 elif ext in RAW_EXT:
-                    stems_with_raw.add(os.path.splitext(low)[0])
-            for n in names:
+                    stems_with_raw.add(stem)
+                    has_camera_photo = True
+                elif ext in MUSIC_EXT:
+                    has_music = True
+                elif ext in PHOTO_EXT and CAMERA_NAME_RE.match(n):
+                    has_camera_photo = True
+            on_card = any(part.upper() in CAMERA_DIRS for part in d.parts)
+            # songs before pictures, so album covers can follow the songs next to them
+            for n in sorted(names, key=lambda x: (os.path.splitext(x.lower())[1] in PHOTO_EXT, x.lower())):
                 if cancel():
                     return
                 low = n.lower()
-                if low in SKIP_FILES or n.startswith("._"):
+                if low in SKIP_FILES or n.startswith(("._", "~$")):
                     continue
                 stem, ext = os.path.splitext(low)
-                if ext not in exts:
+                if ext in SIDECAR_EXT or ext in JUNK_EXT or low.endswith(PART_SUFFIX):
+                    continue
+                kind = kind_of(ext)
+                if kind == "photo" and has_music and (stem in ART_STEMS or stem.startswith("albumart")):
+                    kind = "art"
+                if not wanted(kind, settings):
                     continue
                 f = d / n
                 key = os.path.normcase(os.path.abspath(f))
@@ -202,7 +273,10 @@ def gather(paths: list[Path], exts: set[str], dest_root: Path | None = None, can
                 # IMG_1.xmp next to both IMG_1.CR2 and IMG_1.JPG goes with the RAW
                 if ext in RAW_EXT or stem not in stems_with_raw:
                     cars += cars_by_key.get(stem, [])
-                yield Item(src=f, size=size, sidecars=[d / c for c in sorted(set(cars))])
+                it = Item(src=f, size=size, kind=kind, sidecars=[d / c for c in sorted(set(cars))])
+                if kind == "video":
+                    it.camera = bool(on_card or has_camera_photo or CAMERA_NAME_RE.match(n))
+                yield it
 
 
 # --------------------------------------------------------------------------- #
@@ -335,18 +409,118 @@ def taken_date(path: Path, use_file_date: bool = True) -> tuple[datetime | None,
     return None, "none"
 
 
-def folder_for(dt: datetime | None, layout: str) -> str:
+def date_folder(dt: datetime | None, layout: str) -> str:
     if dt is None:
         return UNDATED
     y, m, d = f"{dt.year}", f"{dt.month:02d}", f"{dt.day:02d}"
     if layout == "year":
         return y
     if layout == "year_monthname":
-        return os.path.join(y, f"{y}-{m}")
+        return f"{y}/{y}-{m}"
     month = f"{m} - {MONTHS[dt.month - 1]}"
     if layout == "year_month_day":
-        return os.path.join(y, month, f"{y}-{m}-{d}")
-    return os.path.join(y, month)
+        return f"{y}/{month}/{y}-{m}-{d}"
+    return f"{y}/{month}"
+
+
+_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def safe_name(s: str, fallback: str) -> str:
+    """A folder name Windows accepts."""
+    s = _BAD_CHARS.sub("_", (s or "").strip())
+    s = re.sub(r"\s+", " ", s)[:80].strip(" .")
+    if not s or s.upper() in _RESERVED:
+        return fallback
+    return s
+
+
+def read_music_tags(path: Path) -> tuple[str, str]:
+    """(artist, album) from the song's tags, preferring the album artist so albums stay together."""
+    try:
+        import mutagen  # type: ignore
+        f = mutagen.File(path, easy=True)
+    except Exception:
+        return "", ""
+    if not f or not getattr(f, "tags", None):
+        return "", ""
+
+    def first(*keys):
+        for k in keys:
+            try:
+                v = f.tags.get(k)
+            except Exception:
+                v = None
+            if v:
+                v = v[0] if isinstance(v, list) else v
+                if str(v).strip():
+                    return str(v).strip()
+        return ""
+
+    artist = first("albumartist", "album artist", "WM/AlbumArtist", "artist", "Author")
+    album = first("album", "WM/AlbumTitle")
+    if not first("albumartist", "album artist", "WM/AlbumArtist") and first("compilation") in ("1", "True", "true"):
+        artist = "Various Artists"
+    return artist, album
+
+
+def read_info(it: Item, settings: dict) -> None:
+    """Fill in what a file's folder depends on (the date, or artist and album)."""
+    if it.kind in ("raw", "photo", "video"):
+        it.taken, it.date_source = taken_date(it.src, settings.get("no_date") != "undated")
+    elif it.kind == "music":
+        it.artist, it.album = read_music_tags(it.src)
+        if not it.album:
+            # untagged songs stay together under the name of the folder they were in
+            parent = it.src.parent.name
+            if parent and parent.lower() not in ("music", "my music", "songs", "itunes", "downloads", "desktop"):
+                it.album = parent
+
+
+def plan(items: list[Item], s: dict, album_of_dir: dict | None = None) -> None:
+    """Decide the folder for every waiting item from the current options. Pass the same
+    album_of_dir between batches so album covers find the songs they were next to."""
+    layout = s.get("layout", "year_month")
+    if album_of_dir is None:
+        album_of_dir = {}
+    for it in items:
+        if it.status != "Waiting":
+            continue
+        if it.kind in ("raw", "photo"):
+            f = f"{LIB['photo']}/{date_folder(it.taken, layout)}"
+            if s.get("raw_split") == "split":
+                f += "/RAW" if it.kind == "raw" else "/JPEG"
+        elif it.kind == "video":
+            mode = s.get("camera_videos", "photos_sub") if it.camera else None
+            if mode == "photos_sub":
+                f = f"{LIB['photo']}/{date_folder(it.taken, layout)}/Videos"
+            elif mode == "photos_mixed":
+                f = f"{LIB['photo']}/{date_folder(it.taken, layout)}"
+            elif mode == "videos" or s.get("other_videos", "by_date") == "by_date":
+                f = f"{LIB['video']}/{date_folder(it.taken, layout)}"
+            else:
+                f = LIB["video"]
+        elif it.kind == "music":
+            f = (f"{LIB['music']}/{safe_name(it.artist, 'Unknown Artist')}/"
+                 f"{safe_name(it.album, 'Unknown Album')}")
+            album_of_dir.setdefault(it.src.parent, f)
+        elif it.kind == "doc":
+            ext = it.src.suffix.lower()
+            f = f"{LIB['doc']}/" + next(g for g, e in DOC_GROUPS.items() if ext in e)
+        elif it.kind == "other":
+            ext = it.src.suffix.lstrip(".").upper()
+            f = f"{LIB['other']}/{safe_name(ext, 'No extension') if ext else 'No extension'}"
+        else:
+            continue
+        it.folder = f
+    for it in items:   # album covers go with the songs they were next to
+        if it.status == "Waiting" and it.kind == "art":
+            it.folder = album_of_dir.get(it.src.parent, f"{LIB['music']}/Unknown Artist/Unknown Album")
+
+
+KIND_LABEL = {"raw": "RAW", "photo": "Photo", "video": "Video", "music": "Music", "art": "Album cover",
+              "doc": "Document", "other": "Other"}
 
 
 # --------------------------------------------------------------------------- #
@@ -666,3 +840,64 @@ def keep_awake(on: bool):
         ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Memory cards: which drive a file came from, and ejecting it
+# --------------------------------------------------------------------------- #
+def drive_of(p: Path) -> str:
+    """'E:\\' on Windows, '/Volumes/CARD' on a Mac, '' if it isn't a separate drive."""
+    p = Path(p)
+    if os.name == "nt":
+        return p.drive.upper() + "\\" if p.drive and not p.drive.startswith("\\\\") else ""
+    parts = p.parts
+    if sys.platform == "darwin" and len(parts) >= 3 and parts[1] == "Volumes":
+        return f"/Volumes/{parts[2]}"
+    if len(parts) >= 4 and parts[1] in ("media", "run", "mnt"):
+        return str(Path(*parts[:4])) if parts[1] != "mnt" else str(Path(*parts[:3]))
+    return ""
+
+
+def can_eject(drive: str, dest: Path | None) -> bool:
+    if not drive or (dest and drive_of(dest) == drive):
+        return False
+    if os.name == "nt":
+        sysdrive = (os.environ.get("SystemDrive", "C:") + "\\").upper()
+        if drive == sysdrive:
+            return False
+        try:
+            import ctypes
+            # 2 = removable (card readers, USB sticks), 3 = fixed (USB hard drives also say this)
+            return ctypes.windll.kernel32.GetDriveTypeW(drive) in (2, 3)
+        except Exception:
+            return True
+    return sys.platform == "darwin"
+
+
+def eject(drive: str) -> tuple[bool, str]:
+    """Ask the system to eject the drive. Returns (ok, message)."""
+    import subprocess
+    try:
+        if os.name == "nt":
+            letter = drive.rstrip("\\")
+            ps = (f"$d=(New-Object -ComObject Shell.Application).Namespace(17).ParseName('{letter}');"
+                  "if($d){$d.InvokeVerb('Eject')}")
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), capture_output=True)
+            for _ in range(20):
+                if not os.path.exists(drive):
+                    return True, f"{letter} is safe to remove."
+                time.sleep(0.5)
+            return False, (f"Windows didn't eject {letter}. Something else may still be using it (a "
+                           "File Explorer window or photo program). Close those and try again.")
+        if sys.platform == "darwin":
+            r = subprocess.run(["diskutil", "eject", drive], capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                return True, f"{Path(drive).name} is safe to remove."
+            return False, (r.stderr or r.stdout or "The Mac didn't eject it.").strip()
+        r = subprocess.run(["gio", "mount", "-e", drive], capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            return True, f"{drive} is safe to remove."
+        return False, (r.stderr or "Couldn't eject it.").strip()
+    except Exception as e:
+        return False, f"Couldn't eject it: {e}"

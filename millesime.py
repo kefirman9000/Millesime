@@ -1,21 +1,25 @@
 """
-Millésime: drop memory-card folders on the window and it copies every photo and video onto your
-destination drive in Year / Month folders. Duplicates are skipped, nothing is ever overwritten,
-and your cards are only read, never changed.
+Millésime: drop memory cards, old drives or folders on the window and it copies everything into
+one tidy library on your new drive: Photos and Videos by date, Music by artist and album,
+Documents by type. Duplicates are skipped, nothing is ever overwritten, and your cards are only
+read, never changed.
 """
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QThread, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
-                               QHeaderView, QInputDialog, QLabel, QMainWindow, QMessageBox,
-                               QProgressBar, QPushButton, QTableView, QVBoxLayout, QWidget)
+from PySide6.QtGui import QAction, QColor, QDesktopServices
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
+                               QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+                               QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QTableView,
+                               QToolButton, QVBoxLayout, QWidget)
 
 import engine
 import updater
@@ -32,35 +36,35 @@ def open_path(p: Path):
 # Background work
 # --------------------------------------------------------------------------- #
 class ScanWorker(QThread):
-    found = Signal(list)          # batches of Items
+    found = Signal(list)          # batches of Items, already given their folders
     status = Signal(str)
 
     def __init__(self, paths, settings, dest):
         super().__init__()
         self.paths, self.settings, self.dest = paths, dict(settings), dest
+        self.drives = {engine.drive_of(p) for p in paths} - {""}
         self.stop = False
 
     def run(self):
-        exts = engine.kinds_from_settings(self.settings)
-        use_file_date = self.settings.get("no_date") != "undated"
-        layout = self.settings.get("layout", "year_month")
+        albums: dict = {}
         batch, n, last = [], 0, time.monotonic()
         try:
-            for it in engine.gather(self.paths, exts, self.dest, lambda: self.stop):
+            for it in engine.gather(self.paths, self.settings, self.dest, lambda: self.stop):
                 if self.stop:
                     break
-                it.taken, it.date_source = engine.taken_date(it.src, use_file_date)
-                it.folder = engine.folder_for(it.taken, layout)
+                engine.read_info(it, self.settings)
                 batch.append(it)
                 n += 1
                 if time.monotonic() - last > 0.25:
+                    engine.plan(batch, self.settings, albums)
                     self.found.emit(batch)
                     batch, last = [], time.monotonic()
-                    self.status.emit(f"Reading dates… {n:,} files")
+                    self.status.emit(f"Reading files… {n:,} found")
         except Exception as e:
             engine.log_error("Scanning", e)
             self.status.emit(f"Problem while reading the files: {e}")
         if batch:
+            engine.plan(batch, self.settings, albums)
             self.found.emit(batch)
 
 
@@ -69,9 +73,11 @@ class CopyWorker(QThread):
     status = Signal(str)
     row_done = Signal(int)
 
-    def __init__(self, items, rows, dest):
+    def __init__(self, items, rows, dest, more_coming):
         super().__init__()
-        self.items, self.rows, self.dest = items, rows, dest
+        self.items, self.dest = items, dest
+        self.queue: deque[int] = deque(rows)   # files dropped while copying are added here
+        self.more_coming = more_coming
         self.stop = False
         self.error = ""
         self.log_path = None
@@ -86,28 +92,37 @@ class CopyWorker(QThread):
             self.status.emit("Checking what's already on the destination drive…")
             index = engine.DestIndex(self.dest)
             index.build(lambda n: self.status.emit(f"Checking what's already on the drive… {n:,} files"), cancel)
-            total = len(self.rows)
-            done_bytes = 0
-            for k, r in enumerate(self.rows):
+            done, done_bytes = 0, 0
+            while True:
                 if self.stop:
                     self.cancelled = True
                     break
+                if not self.queue:
+                    if self.more_coming():
+                        self.status.emit("Waiting for the files you dropped to be read…")
+                        time.sleep(0.2)
+                        continue
+                    break
+                r = self.queue.popleft()
                 it = self.items[r]
-                self.status.emit(f"Copying {it.src.name}  →  {it.folder}")
+                if it.status != "Waiting":
+                    continue
+                self.status.emit(f"Copying {it.src.name}  →  {it.folder.replace('/', ' › ')}")
                 try:
                     engine.process(it, index, cancel)
                 except engine.Cancelled:
-                    it.status, it.note = "Waiting", ""
+                    it.status, it.note, it.dest = "Waiting", "", ""
                     self.cancelled = True
                     break
                 except Exception as e:
                     engine.log_error(f"Copying {it.src}", e)
                     it.status, it.note = "Error", str(e)
                 done_items.append(it)
+                done += 1
                 done_bytes += it.size
                 self.row_done.emit(r)
-                self.progress.emit(k + 1, total, done_bytes)
-                if (k + 1) % 200 == 0:
+                self.progress.emit(done, done + len(self.queue), done_bytes)
+                if done % 200 == 0:
                     index.save()
             index.save()
         except engine.Cancelled:
@@ -119,6 +134,15 @@ class CopyWorker(QThread):
             engine.keep_awake(False)
             if done_items:
                 self.log_path = engine.write_log(self.dest, done_items, started)
+
+
+class EjectWorker(QThread):
+    def __init__(self, drive):
+        super().__init__()
+        self.drive, self.ok, self.msg = drive, False, ""
+
+    def run(self):
+        self.ok, self.msg = engine.eject(self.drive)
 
 
 class UpdateCheckWorker(QThread):
@@ -160,11 +184,12 @@ STATUS_COLORS = {"Copied": "#2e9d4f", "Copied (renamed)": "#2b7bd6", "Duplicate"
 
 
 class ItemModel(QAbstractTableModel):
-    HEAD = ["File", "Taken", "Goes to", "Result", "Note"]
+    HEAD = ["File", "Kind", "Taken / Album", "Goes to", "Result", "Note"]
 
     def __init__(self):
         super().__init__()
         self.items: list[engine.Item] = []
+        self.keys: set[str] = set()
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.items)
@@ -184,30 +209,44 @@ class ItemModel(QAbstractTableModel):
             if c == 0:
                 return it.src.name
             if c == 1:
+                k = engine.KIND_LABEL.get(it.kind, it.kind)
+                return k + (" (camera)" if it.kind == "video" and it.camera else "")
+            if c == 2:
+                if it.kind == "music":
+                    return f"{it.artist or 'Unknown Artist'} – {it.album or 'Unknown Album'}"
+                if it.kind not in ("raw", "photo", "video"):
+                    return ""
                 if not it.taken:
                     return "no date"
                 t = it.taken.strftime("%Y-%m-%d %H:%M")
                 return t + ("  (file date)" if it.date_source == "file date" else "")
-            if c == 2:
-                return (it.dest or it.folder).replace("/", " \\ ").replace(os.sep, " \\ ")
             if c == 3:
-                return it.status
+                return (it.dest or it.folder).replace("/", " \\ ")
             if c == 4:
+                return it.status
+            if c == 5:
                 return it.note
         if role == Qt.ToolTipRole:
             return f"{it.src}\n{engine.human_size(it.size)}" + (
                 "\nWith: " + ", ".join(p.name for p in it.sidecars) if it.sidecars else "")
-        if role == Qt.ForegroundRole and c == 3 and it.status in STATUS_COLORS:
+        if role == Qt.ForegroundRole and c == 4 and it.status in STATUS_COLORS:
             return QColor(STATUS_COLORS[it.status])
         return None
 
-    def add(self, batch):
-        if not batch:
-            return
+    def add(self, batch) -> list[int]:
+        new = []
+        for b in batch:
+            k = os.path.normcase(str(b.src))
+            if k not in self.keys:
+                self.keys.add(k)
+                new.append(b)
+        if not new:
+            return []
         n = len(self.items)
-        self.beginInsertRows(QModelIndex(), n, n + len(batch) - 1)
-        self.items.extend(batch)
+        self.beginInsertRows(QModelIndex(), n, n + len(new) - 1)
+        self.items.extend(new)
         self.endInsertRows()
+        return list(range(n, n + len(new)))
 
     def refresh_row(self, r):
         self.dataChanged.emit(self.index(r, 0), self.index(r, len(self.HEAD) - 1))
@@ -219,6 +258,7 @@ class ItemModel(QAbstractTableModel):
     def clear(self):
         self.beginResetModel()
         self.items = []
+        self.keys = set()
         self.endResetModel()
 
 
@@ -229,10 +269,11 @@ class DropZone(QFrame):
         super().__init__()
         self.setAcceptDrops(True)
         self.setFrameShape(QFrame.StyledPanel)
-        self.setMinimumHeight(130)
+        self.setMinimumHeight(110)
         lay = QVBoxLayout(self)
-        self.label = QLabel("Drop memory card folders, or files, here\n\n"
-                            "They're only read. Nothing on the card is changed.")
+        self.label = QLabel("Drop memory cards, old drives or folders here\n\n"
+                            "They're only read. Nothing on them is changed. "
+                            "You can keep dropping more while it copies.")
         self.label.setAlignment(Qt.AlignCenter)
         f = self.label.font()
         f.setPointSize(f.pointSize() + 3)
@@ -245,7 +286,7 @@ class DropZone(QFrame):
                            % ("#2b7bd6" if hot else "#888", "background: rgba(43,123,214,0.12);" if hot else ""))
 
     def dragEnterEvent(self, e):
-        if self.isEnabled() and e.mimeData().hasUrls():
+        if e.mimeData().hasUrls():
             e.acceptProposedAction()
             self._style(True)
 
@@ -259,6 +300,14 @@ class DropZone(QFrame):
             self.dropped.emit(paths)
 
 
+def _combo(options: dict, current: str) -> QComboBox:
+    c = QComboBox()
+    for k, label in options.items():
+        c.addItem(label, k)
+    c.setCurrentIndex(max(0, c.findData(current)))
+    return c
+
+
 # --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
@@ -268,11 +317,13 @@ class MainWindow(QMainWindow):
         self.settings = engine.load_settings()
         self.scanners: list[ScanWorker] = []
         self.copier: CopyWorker | None = None
+        self.ejector: EjectWorker | None = None
+        self.ejected: set[str] = set()
         self._upd_check = None
         self._upd_apply = None
         self._copy_t0 = 0.0
-        self.setWindowTitle(f"{APP_NAME} — sort photos onto a drive by date")
-        self.resize(1100, 720)
+        self.setWindowTitle(f"{APP_NAME} — sort cards and old drives onto a new drive")
+        self.resize(1180, 800)
         self._menus()
 
         w = QWidget()
@@ -280,7 +331,7 @@ class MainWindow(QMainWindow):
 
         # destination
         row = QHBoxLayout()
-        row.addWidget(QLabel("<b>Destination drive / folder:</b>"))
+        row.addWidget(QLabel("<b>Library folder on the new drive:</b>"))
         self.dest_label = QLabel()
         self.dest_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         row.addWidget(self.dest_label, 1)
@@ -292,42 +343,58 @@ class MainWindow(QMainWindow):
         row.addWidget(self.b_open_dest)
         v.addLayout(row)
 
-        # options
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Folders:"))
-        self.layout_box = QComboBox()
-        for k, label in engine.LAYOUTS.items():
-            self.layout_box.addItem(label, k)
-        self.layout_box.setCurrentIndex(max(0, self.layout_box.findData(self.settings["layout"])))
-        self.layout_box.currentIndexChanged.connect(self._options_changed)
-        row.addWidget(self.layout_box)
-        row.addSpacing(16)
-        row.addWidget(QLabel("Include:"))
-        self.c_raw = QCheckBox("RAW")
-        self.c_photos = QCheckBox("JPEG / HEIC / other photos")
+        # sorting options
+        box = QGroupBox("How to sort")
+        g = QGridLayout(box)
+        inc = QHBoxLayout()
+        self.c_photos = QCheckBox("Photos && RAW")
         self.c_videos = QCheckBox("Videos")
-        for c, k in ((self.c_raw, "raw"), (self.c_photos, "photos"), (self.c_videos, "videos")):
-            c.setChecked(self.settings.get(k, True))
+        self.c_music = QCheckBox("Music")
+        self.c_docs = QCheckBox("Documents")
+        self.c_other = QCheckBox("Everything else")
+        self.c_other.setToolTip("Any other kind of file goes in Other, in a folder per file type (ZIP, EXE …).")
+        self.includes = {"photos": self.c_photos, "videos": self.c_videos, "music": self.c_music,
+                         "docs": self.c_docs, "other": self.c_other}
+        for k, c in self.includes.items():
+            c.setChecked(self.settings.get(k, engine.DEFAULT_SETTINGS[k]))
             c.toggled.connect(self._options_changed)
-            row.addWidget(c)
-        row.addStretch(1)
-        v.addLayout(row)
+            inc.addWidget(c)
+        inc.addStretch(1)
+        g.addWidget(QLabel("Include:"), 0, 0)
+        g.addLayout(inc, 0, 1, 1, 3)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("If a file has no date inside it:"))
-        self.nodate_box = QComboBox()
-        self.nodate_box.addItem("Use the file's date (what the camera saved)", "file_date")
-        self.nodate_box.addItem("Put it in an \"Undated\" folder", "undated")
-        self.nodate_box.setCurrentIndex(max(0, self.nodate_box.findData(self.settings["no_date"])))
-        self.nodate_box.currentIndexChanged.connect(self._options_changed)
-        row.addWidget(self.nodate_box)
-        row.addSpacing(16)
+        self.layout_box = _combo(engine.LAYOUTS, self.settings["layout"])
+        self.raw_box = _combo(engine.RAW_SPLIT, self.settings["raw_split"])
+        self.camvid_box = _combo(engine.CAMERA_VIDEOS, self.settings["camera_videos"])
+        self.camvid_box.setToolTip("Videos from cameras and phones: found in a card's DCIM folder, next to "
+                                   "camera photos, or named like one (MVI_, DSC, GOPR, C0001, VID_ …).")
+        self.othervid_box = _combo(engine.OTHER_VIDEOS, self.settings["other_videos"])
+        self.othervid_box.setToolTip("Any other videos (downloads, movies, screen recordings).")
+        self.nodate_box = _combo({"file_date": "Use the file's date (what the camera saved)",
+                                  "undated": "Put it in an \"Undated\" folder"}, self.settings["no_date"])
+        g.addWidget(QLabel("Photo folders:"), 1, 0)
+        g.addWidget(self.layout_box, 1, 1)
+        g.addWidget(QLabel("RAW / JPEG:"), 1, 2)
+        g.addWidget(self.raw_box, 1, 3)
+        g.addWidget(QLabel("Camera videos:"), 2, 0)
+        g.addWidget(self.camvid_box, 2, 1)
+        g.addWidget(QLabel("Other videos:"), 2, 2)
+        g.addWidget(self.othervid_box, 2, 3)
+        g.addWidget(QLabel("No date inside:"), 3, 0)
+        g.addWidget(self.nodate_box, 3, 1)
         self.c_auto = QCheckBox("Start copying as soon as I drop files")
         self.c_auto.setChecked(self.settings.get("auto_start", False))
+        g.addWidget(self.c_auto, 3, 2, 1, 2)
+        for c in (self.layout_box, self.raw_box, self.camvid_box, self.othervid_box, self.nodate_box):
+            c.currentIndexChanged.connect(self._options_changed)
         self.c_auto.toggled.connect(self._options_changed)
-        row.addWidget(self.c_auto)
-        row.addStretch(1)
-        v.addLayout(row)
+        self.example = QLabel()
+        self.example.setStyleSheet("color: gray")
+        self.example.setWordWrap(True)
+        g.addWidget(self.example, 4, 0, 1, 4)
+        g.setColumnStretch(1, 1)
+        g.setColumnStretch(3, 1)
+        v.addWidget(box)
 
         self.drop = DropZone()
         self.drop.dropped.connect(self.add_paths)
@@ -337,6 +404,14 @@ class MainWindow(QMainWindow):
         b = QPushButton("Add a folder…")
         b.clicked.connect(self.add_folder)
         row.addWidget(b)
+        self.b_eject = QToolButton()
+        self.b_eject.setText("Eject card")
+        self.b_eject.setPopupMode(QToolButton.InstantPopup)
+        self.eject_menu = QMenu(self)
+        self.eject_menu.aboutToShow.connect(self._fill_eject_menu)
+        self.b_eject.setMenu(self.eject_menu)
+        self.b_eject.setToolTip("Safely remove a memory card or drive once its files are done")
+        row.addWidget(self.b_eject)
         self.summary = QLabel("")
         row.addWidget(self.summary, 1)
         self.b_clear = QPushButton("Clear list")
@@ -364,7 +439,7 @@ class MainWindow(QMainWindow):
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(QHeaderView.Interactive)
         h.setStretchLastSection(True)
-        for col, wd in enumerate((220, 190, 300, 120)):
+        for col, wd in enumerate((200, 110, 200, 320, 120)):
             self.table.setColumnWidth(col, wd)
         self.table.doubleClicked.connect(self._open_row)
         v.addWidget(self.table, 1)
@@ -377,6 +452,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(w)
 
         self._show_dest()
+        self._show_example()
         self._update_buttons()
         if self.settings.get("check_updates", True):
             QTimer.singleShot(2500, lambda: self.check_updates(quiet=True))
@@ -384,7 +460,7 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------- menus
     def _menus(self):
         m = self.menuBar().addMenu("&File")
-        a = QAction("Choose destination…", self)
+        a = QAction("Choose library folder…", self)
         a.triggered.connect(self.choose_dest)
         m.addAction(a)
         a = QAction("Add a folder…", self)
@@ -427,25 +503,27 @@ class MainWindow(QMainWindow):
         m.addAction(a)
         a = QAction(f"About {APP_NAME}", self)
         a.triggered.connect(lambda: QMessageBox.about(
-            self, APP_NAME, f"<b>{APP_NAME}</b> {updater.local_version()}<br>Copies photos and videos from "
-            f"memory cards onto a drive in date folders, without duplicates and without overwriting "
-            f"anything.<br><br><a href='{updater.PAGE_URL}'>{updater.PAGE_URL}</a><br>"
-            f"Enjoying it? <a href='{SPONSOR_URL}'>Support development on GitHub Sponsors</a>."))
+            self, APP_NAME, f"<b>{APP_NAME}</b> {updater.local_version()}<br>Copies memory cards and old "
+            f"drives into one tidy library: photos and videos by date, music by artist and album, without "
+            f"duplicates and without overwriting anything.<br><br><a href='{updater.PAGE_URL}'>"
+            f"{updater.PAGE_URL}</a><br>Enjoying it? <a href='{SPONSOR_URL}'>Support development on "
+            f"GitHub Sponsors</a>."))
         m.addAction(a)
 
     def _how(self):
         QMessageBox.information(self, "How it works", (
-            "1. Choose the destination drive (or a folder on it).\n"
-            "2. Drop memory card folders or files on the window.\n"
+            "1. Choose a library folder on the new drive (for example D:\\Library).\n"
+            "2. Drop memory cards, old drives or folders on the window. Keep dropping more while it copies.\n"
             "3. Check the list, then press Start copying.\n\n"
-            "• Files go into folders by the date the picture was taken (read from inside the photo or "
-            "video), e.g. 2019 \\ 07 - July.\n"
-            "• A file that's exactly the same as one already on the drive (byte for byte) is skipped.\n"
-            "• A different picture with the same name is saved with a number added: IMG_0001_1.CR2.\n"
-            "• Nothing on the drive is ever overwritten, and nothing on your cards is changed or deleted.\n"
+            "• Photos and RAW go to Photos \\ year \\ month, by the date the picture was taken.\n"
+            "• Camera and phone videos go with their photos, or to Videos, as you choose.\n"
+            "• Music goes to Music \\ artist \\ album, read from the songs' tags. Album covers follow.\n"
+            "• Documents go to Documents \\ PDFs, Spreadsheets and so on.\n"
+            "• A file that's exactly the same as one already in the library (byte for byte) is skipped.\n"
+            "• A different file with the same name gets a number added: IMG_0001_1.CR2.\n"
+            "• Nothing in the library is ever overwritten, and nothing on your cards is changed or deleted.\n"
             "• Every copy is checked against the original before it's kept.\n"
-            "• .xmp and other sidecar files travel with their photo.\n"
-            "• A log of what happened to every file is saved on the drive (File > Open sort logs)."))
+            "• When a card is done, use Eject card to remove it safely."))
 
     # ------------------------------------------------------------ destination
     def dest(self) -> Path | None:
@@ -456,22 +534,22 @@ class MainWindow(QMainWindow):
         if self.copier:
             return
         start = str(self.dest() or Path.home())
-        d = QFileDialog.getExistingDirectory(self, "Where should the photos go?", start)
+        d = QFileDialog.getExistingDirectory(self, "Choose (or make) the library folder on the new drive", start)
         if d:
             self.settings["destination"] = d
             engine.save_settings(self.settings)
             self._show_dest()
-            self._relayout()
+            self._show_example()
 
     def _show_dest(self):
         d = self.dest()
         if not d:
-            self.dest_label.setText("<i>not chosen yet — press Choose…</i>")
+            self.dest_label.setText("<i>not chosen yet — press Choose… and pick a folder on the new drive</i>")
         elif not d.exists():
             self.dest_label.setText(f"{d}   <span style='color:#d23c3c'>(not connected)</span>")
         else:
             try:
-                free = engine.human_size(__import__("shutil").disk_usage(d).free)
+                free = engine.human_size(shutil.disk_usage(d).free)
                 self.dest_label.setText(f"{d}   <span style='color:gray'>({free} free)</span>")
             except OSError:
                 self.dest_label.setText(str(d))
@@ -479,67 +557,92 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- options
     def _options_changed(self):
-        old = (self.settings.get("raw"), self.settings.get("photos"), self.settings.get("videos"),
-               self.settings.get("no_date"))
-        self.settings.update(layout=self.layout_box.currentData(), raw=self.c_raw.isChecked(),
-                             photos=self.c_photos.isChecked(), videos=self.c_videos.isChecked(),
+        old_inc = {k: self.settings.get(k) for k in self.includes}
+        old_nodate = self.settings.get("no_date")
+        for k, c in self.includes.items():
+            self.settings[k] = c.isChecked()
+        self.settings.update(layout=self.layout_box.currentData(), raw_split=self.raw_box.currentData(),
+                             camera_videos=self.camvid_box.currentData(),
+                             other_videos=self.othervid_box.currentData(),
                              no_date=self.nodate_box.currentData(), auto_start=self.c_auto.isChecked())
         engine.save_settings(self.settings)
-        new = (self.settings["raw"], self.settings["photos"], self.settings["videos"], self.settings["no_date"])
-        if new != old and self.model.items and not self.copier:
-            self.status.setText("Settings changed. Drop the folders again to use them for this list.")
-        self._relayout()
+        changed_scan = (old_inc != {k: self.settings[k] for k in self.includes}
+                        or old_nodate != self.settings["no_date"])
+        if changed_scan and self.model.items and not self.copier:
+            self.status.setText("Include / date settings changed. Clear the list and drop the folders again "
+                                "to use them for these files.")
+        self._show_example()
+        self._replan()
 
-    def _relayout(self):
-        """Update where waiting files will go after the folder layout changes."""
+    def _replan(self):
+        """Update where waiting files will go after a folder option changes."""
         if self.copier:
             return
-        layout = self.settings.get("layout", "year_month")
-        for it in self.model.items:
-            if it.status == "Waiting":
-                it.folder = engine.folder_for(it.taken, layout)
+        engine.plan(self.model.items, self.settings, {})
         self.model.refresh_all()
+
+    def _show_example(self):
+        s = self.settings
+        root = str(self.dest() or "Library")
+        dt = datetime(2019, 7, 4)
+        probe = [
+            ("photos", engine.Item(src=Path("IMG_0001.CR2"), size=0, kind="raw", taken=dt)),
+            ("videos", engine.Item(src=Path("MVI_0042.MP4"), size=0, kind="video", camera=True, taken=dt)),
+            ("music", engine.Item(src=Path("01 Song.mp3"), size=0, kind="music", artist="Artist", album="Album")),
+            ("docs", engine.Item(src=Path("Taxes.pdf"), size=0, kind="doc")),
+        ]
+        items = [it for k, it in probe if s.get(k)]
+        engine.plan(items, s, {})
+        lines = [f"{root}\\{it.folder}\\{it.src.name}".replace("/", "\\") for it in items]
+        self.example.setText("Example:  " + "     ".join(lines) if lines else "Nothing is included. Tick a box above.")
 
     # ------------------------------------------------------------------ files
     def add_folder(self):
-        if self.copier:
-            return
-        d = QFileDialog.getExistingDirectory(self, "Choose a memory card or folder to sort")
+        d = QFileDialog.getExistingDirectory(self, "Choose a memory card, drive or folder to sort")
         if d:
             self.add_paths([Path(d)])
 
     def add_paths(self, paths):
-        if self.copier:
-            self.status.setText("Copying is running. Drop more when it's finished.")
-            return
         dest = self.dest()
         if not dest:
-            QMessageBox.information(self, APP_NAME, "First choose the destination drive (Choose… at the top).")
+            QMessageBox.information(self, APP_NAME, "First choose the library folder on the new drive "
+                                    "(Choose… at the top).")
             self.choose_dest()
             dest = self.dest()
             if not dest:
                 return
-        known = {str(it.src) for it in self.model.items}
+        if not dest.exists():
+            QMessageBox.warning(self, APP_NAME, "The new drive isn't connected. Plug it in first.")
+            return
         s = ScanWorker(paths, self.settings, dest)
-        s.found.connect(lambda batch: (self.model.add([b for b in batch if str(b.src) not in known]),
-                                       self._update_summary()))
-        s.status.connect(self.status.setText)
+        self.ejected -= s.drives
+        s.found.connect(self._found)
+        s.status.connect(lambda t: self.copier is None and self.status.setText(t))
         s.finished.connect(lambda: self._scan_done(s))
         self.scanners.append(s)
-        self.status.setText("Looking for photos and videos…")
+        if not self.copier:
+            self.status.setText("Looking for files…")
         self._update_buttons()
         s.start()
+        if self.settings.get("auto_start") and not self.copier:
+            self.start()        # files are copied as they're found
+
+    def _found(self, batch):
+        rows = self.model.add(batch)
+        if self.copier and rows:
+            self.copier.queue.extend(rows)      # joins the copy that's already running
+        self._update_summary()
 
     def _scan_done(self, s):
         if s in self.scanners:
             self.scanners.remove(s)
         self._update_summary()
         self._update_buttons()
-        if self.scanners:
+        if self.scanners or self.copier:
             return
         waiting = sum(1 for it in self.model.items if it.status == "Waiting")
         if not waiting:
-            self.status.setText("No photos or videos found there (check the Include boxes above).")
+            self.status.setText("Nothing new to copy there (check the Include boxes above).")
             return
         self.status.setText(f"{waiting:,} files ready. Check the list, then press Start copying.")
         if self.settings.get("auto_start"):
@@ -552,13 +655,15 @@ class MainWindow(QMainWindow):
             return
         waiting = [it for it in items if it.status == "Waiting"]
         size = sum(it.size for it in waiting)
-        years = sorted({it.taken.year for it in waiting if it.taken})
-        span = f" · {years[0]}–{years[-1]}" if len(years) > 1 else (f" · {years[0]}" if years else "")
-        undated = sum(1 for it in waiting if it.date_source in ("file date", "none"))
-        extra = f" · {undated:,} without a date inside" if undated else ""
+        counts: dict[str, int] = {}
+        for it in waiting:
+            k = {"raw": "photos", "photo": "photos", "video": "videos", "music": "songs", "art": "songs",
+                 "doc": "documents", "other": "other"}[it.kind]
+            counts[k] = counts.get(k, 0) + 1
+        parts = ", ".join(f"{n:,} {k}" for k, n in counts.items())
         done = len(items) - len(waiting)
-        self.summary.setText(f"  {len(waiting):,} to copy ({engine.human_size(size)}){span}{extra}"
-                             + (f" · {done:,} done" if done else ""))
+        self.summary.setText(f"  {len(waiting):,} to copy ({engine.human_size(size)})"
+                             + (f": {parts}" if parts else "") + (f" · {done:,} done" if done else ""))
 
     def clear(self):
         if self.copier or self.scanners:
@@ -573,7 +678,7 @@ class MainWindow(QMainWindow):
         d = self.dest()
         if it.dest and d and (d / it.dest).exists():
             open_path((d / it.dest).parent)
-        else:
+        elif it.src.parent.exists():
             open_path(it.src.parent)
 
     def _open_logs(self):
@@ -582,45 +687,45 @@ class MainWindow(QMainWindow):
         if p and p.is_dir():
             open_path(p)
         else:
-            QMessageBox.information(self, "Sort logs", "No sort logs on this destination yet.")
+            QMessageBox.information(self, "Sort logs", "No sort logs in this library yet.")
 
     # ---------------------------------------------------------------- copying
     def start(self):
-        if self.copier or self.scanners:
+        if self.copier:
             return
         dest = self.dest()
         if not dest or not dest.exists():
-            QMessageBox.warning(self, APP_NAME, "The destination drive isn't connected (or not chosen). "
-                                "Plug it in or press Choose….")
+            QMessageBox.warning(self, APP_NAME, "The library folder isn't available (drive not connected, or "
+                                "not chosen). Plug the drive in or press Choose….")
             return
         rows = [r for r, it in enumerate(self.model.items) if it.status in ("Waiting", "Error")]
-        if not rows:
+        if not rows and not self.scanners:
             self.status.setText("Nothing waiting to copy.")
             return
         need = sum(self.model.items[r].size for r in rows)
         try:
-            import shutil
             free = shutil.disk_usage(dest).free
-            if need > free:
-                if QMessageBox.question(
-                        self, "Not enough space?",
-                        f"These files are {engine.human_size(need)} and the drive has {engine.human_size(free)} "
-                        "free. Duplicates aren't copied, so it may still fit. Start anyway? (It stops safely "
-                        "if the drive fills up.)") != QMessageBox.Yes:
-                    return
+            if need > free and QMessageBox.question(
+                    self, "Not enough space?",
+                    f"These files are {engine.human_size(need)} and the drive has {engine.human_size(free)} "
+                    "free. Duplicates aren't copied, so it may still fit. Start anyway? (It stops safely "
+                    "if the drive fills up.)") != QMessageBox.Yes:
+                return
         except OSError:
             pass
         for r in rows:
             it = self.model.items[r]
             it.status, it.note, it.dest = "Waiting", "", ""
+        engine.plan([self.model.items[r] for r in rows], self.settings, {})
         self.model.refresh_all()
-        c = self.copier = CopyWorker(self.model.items, rows, dest)
+        c = self.copier = CopyWorker(self.model.items, rows, dest, lambda: bool(self.scanners))
         c.status.connect(self.status.setText)
         c.row_done.connect(self._row_done)
         c.progress.connect(self._progress)
         c.finished.connect(self._copy_done)
-        self.bar.setRange(0, len(rows))
+        self.bar.setRange(0, max(1, len(rows)))
         self.bar.setValue(0)
+        self.bar.setFormat("Starting…")
         self.bar.show()
         self._copy_t0 = time.monotonic()
         self._update_buttons()
@@ -629,8 +734,10 @@ class MainWindow(QMainWindow):
     def _row_done(self, r):
         self.model.refresh_row(r)
         self.table.scrollTo(self.model.index(r, 0))
+        self._update_summary()
 
     def _progress(self, done, total, done_bytes):
+        self.bar.setRange(0, max(1, total))
         self.bar.setValue(done)
         secs = max(0.1, time.monotonic() - self._copy_t0)
         rate = done_bytes / secs
@@ -654,9 +761,8 @@ class MainWindow(QMainWindow):
         self._update_buttons()
         self._update_summary()
         self._show_dest()
-        done = [it for it in self.model.items if it.status != "Waiting"]
-        counts = {}
-        for it in done:
+        counts: dict[str, int] = {}
+        for it in self.model.items:
             counts[it.status] = counts.get(it.status, 0) + 1
         copied = counts.get("Copied", 0)
         renamed = counts.get("Copied (renamed)", 0)
@@ -665,7 +771,7 @@ class MainWindow(QMainWindow):
         head = "Stopped." if c.cancelled else ("Something went wrong." if c.error else "All done.")
         msg = (f"{head}\n\n{copied + renamed:,} copied"
                + (f" ({renamed:,} given a number because a different file had the same name)" if renamed else "")
-               + f"\n{dupes:,} skipped because they were already on the drive")
+               + f"\n{dupes:,} skipped because they were already in the library")
         if errors:
             msg += f"\n{errors:,} couldn't be copied (see the Note column; press Start copying to retry them)"
         if c.error:
@@ -673,16 +779,70 @@ class MainWindow(QMainWindow):
         if c.cancelled:
             msg += "\n\nPress Start copying to carry on where it stopped."
         self.status.setText(msg.replace("\n\n", "  ").replace("\n", " · "))
+        drives = self._ejectable()
         box = QMessageBox(QMessageBox.Information if not (errors or c.error) else QMessageBox.Warning,
                           APP_NAME, msg, parent=self)
-        b_open = box.addButton("Open destination", QMessageBox.ActionRole)
+        b_open = box.addButton("Open library", QMessageBox.ActionRole)
         b_log = box.addButton("Open log", QMessageBox.ActionRole) if c.log_path else None
+        b_ej = {box.addButton(f"Eject {self._drive_name(d)}", QMessageBox.ActionRole): d for d in drives[:2]}
         box.addButton(QMessageBox.Close)
         box.exec()
-        if box.clickedButton() is b_open and self.dest():
+        clicked = box.clickedButton()
+        if clicked is b_open and self.dest():
             open_path(self.dest())
-        elif b_log is not None and box.clickedButton() is b_log:
+        elif b_log is not None and clicked is b_log:
             open_path(c.log_path)
+        elif clicked in b_ej:
+            self.eject(b_ej[clicked])
+
+    # ------------------------------------------------------------------ eject
+    @staticmethod
+    def _drive_name(d: str) -> str:
+        return d.rstrip("\\") if os.name == "nt" else Path(d).name
+
+    def _ejectable(self) -> list[str]:
+        """Drives files came from whose files are all finished and that aren't being read."""
+        dest = self.dest()
+        busy = set().union(*(s.drives for s in self.scanners)) if self.scanners else set()
+        state: dict[str, bool] = {}
+        for it in self.model.items:
+            d = engine.drive_of(it.src)
+            if not d:
+                continue
+            state[d] = state.get(d, True) and it.status != "Waiting"
+        return sorted(d for d, finished in state.items()
+                      if finished and d not in busy and d not in self.ejected and os.path.exists(d)
+                      and engine.can_eject(d, dest))
+
+    def _fill_eject_menu(self):
+        self.eject_menu.clear()
+        drives = self._ejectable()
+        if not drives:
+            a = self.eject_menu.addAction("No finished cards to eject")
+            a.setEnabled(False)
+            return
+        for d in drives:
+            a = self.eject_menu.addAction(f"Eject {self._drive_name(d)}")
+            a.triggered.connect(lambda _=False, d=d: self.eject(d))
+
+    def eject(self, drive: str):
+        if self.ejector:
+            return
+        w = self.ejector = EjectWorker(drive)
+        self.status.setText(f"Ejecting {self._drive_name(drive)}…")
+
+        def done():
+            self.ejector = None
+            if w.ok:
+                self.ejected.add(drive)
+                self.status.setText(w.msg)
+                QMessageBox.information(self, "Eject", w.msg)
+            else:
+                self.status.setText(w.msg)
+                QMessageBox.warning(self, "Eject", w.msg)
+
+        w.finished.connect(done)
+        w.start()
 
     def _update_buttons(self):
         busy = bool(self.copier)
@@ -692,8 +852,8 @@ class MainWindow(QMainWindow):
         self.b_start.setVisible(not busy)
         self.b_cancel.setVisible(busy or scanning)
         self.b_clear.setEnabled(not busy and not scanning)
-        self.drop.setEnabled(not busy)
-        for wdg in (self.layout_box, self.c_raw, self.c_photos, self.c_videos, self.nodate_box):
+        for wdg in (self.layout_box, self.raw_box, self.camvid_box, self.othervid_box, self.nodate_box,
+                    *self.includes.values()):
             wdg.setEnabled(not busy)
 
     def closeEvent(self, e):
@@ -702,6 +862,8 @@ class MainWindow(QMainWindow):
                                     "copied are kept; nothing is left half-copied.") != QMessageBox.Yes:
                 e.ignore()
                 return
+            for s in self.scanners:
+                s.stop = True
             self.copier.stop = True
             self.copier.wait(15000)
         for s in self.scanners:
