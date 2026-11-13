@@ -87,6 +87,10 @@ LIB = {"photo": "Photos", "video": "Videos", "music": "Music", "doc": "Documents
 
 SKIP_DIRS = {"system volume information", "$recycle.bin", ".trashes", ".spotlight-v100",
              ".fseventsd", ".temporaryitems", META_NAME}
+# system folders skipped when they sit at the top of a dropped drive (E:\Windows, E:\ProgramData …)
+SKIP_ROOT_DIRS = {"windows", "program files", "program files (x86)", "programdata", "recovery",
+                  "$windows.~bt", "$windows.~ws", "$winreagent", "$sysreset", "msocache", "perflogs",
+                  "config.msi", "boot", "intel", "amd", "nvidia"}
 SKIP_FILES = {"thumbs.db", "desktop.ini", ".ds_store"}
 
 LAYOUTS = {
@@ -272,18 +276,27 @@ def gather(paths: list[Path], settings: dict, dest_root: Path | None = None, can
         p = Path(p)
         if _inside(p, dest_root):
             continue
-        if p.is_file():
+        if any(part.lower() in SKIP_DIRS for part in p.parts):
+            continue
+        try:
+            is_file, is_dir = p.is_file(), p.is_dir()
+        except OSError:                  # Windows refused (system file, Recycle Bin …): skip it
+            continue
+        if is_file:
             try:
                 listing = os.listdir(p.parent)
             except OSError:
                 listing = [p.name]
             dirs = [(p.parent, [p.name], listing)]
-        elif p.is_dir():
+        elif is_dir:
             dirs = []
+            drive_top = os.path.normcase(os.path.normpath(p.anchor)) if p.anchor else None
             for root, dnames, fnames in os.walk(p):
                 if cancel():
                     return
-                dnames[:] = [d for d in dnames if d.lower() not in SKIP_DIRS and not d.startswith("._")]
+                at_drive_top = os.path.normcase(os.path.normpath(root)) == drive_top
+                dnames[:] = [d for d in dnames if d.lower() not in SKIP_DIRS and not d.startswith("._")
+                             and not (at_drive_top and d.lower() in SKIP_ROOT_DIRS)]
                 if _inside(Path(root), dest_root):
                     dnames[:] = []
                     continue
