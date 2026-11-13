@@ -169,6 +169,10 @@ class Item:
     status: str = "Waiting"
     dest: str = ""                 # where it ended up (or the existing copy, for duplicates)
     note: str = ""
+    mtime_ns: int = 0
+    source_id: str = ""            # the card or drive it came from (its volume serial number)
+    source_rel: str = ""           # path on that card
+    known_dest: str = ""           # backed up from this card before, to here
 
 
 def kind_of(ext: str) -> str:
@@ -266,14 +270,16 @@ def gather(paths: list[Path], settings: dict, dest_root: Path | None = None, can
                     continue
                 seen.add(key)
                 try:
-                    size = f.stat().st_size
+                    st = f.stat()
                 except OSError:
                     continue
+                size = st.st_size
                 cars = list(cars_by_key.get(low, []))
                 # IMG_1.xmp next to both IMG_1.CR2 and IMG_1.JPG goes with the RAW
                 if ext in RAW_EXT or stem not in stems_with_raw:
                     cars += cars_by_key.get(stem, [])
-                it = Item(src=f, size=size, kind=kind, sidecars=[d / c for c in sorted(set(cars))])
+                it = Item(src=f, size=size, kind=kind, sidecars=[d / c for c in sorted(set(cars))],
+                          mtime_ns=st.st_mtime_ns)
                 if kind == "video":
                     it.camera = bool(on_card or has_camera_photo or CAMERA_NAME_RE.match(n))
                 yield it
@@ -728,6 +734,15 @@ def process(item: Item, index: DestIndex, cancel=lambda: False) -> None:
             cache["h"] = file_hash(item.src, cancel)
         return cache["h"]
 
+    if item.known_dest:
+        # backed up from this card before, and still in the library: not read again
+        rec = index.info.get(item.known_dest)
+        if rec and rec[0] == item.size and (root / item.known_dest).exists():
+            item.status = "Duplicate"
+            item.dest = item.known_dest
+            item.note = "Already backed up from this card (not read again)"
+            return
+
     same = index.find_identical(item.size, src_hash, cancel)
     if same:
         item.status = "Duplicate"
@@ -841,3 +856,199 @@ def keep_awake(on: bool):
     except Exception:
         pass
 
+
+# --------------------------------------------------------------------------- #
+# Remembering cards (stored in the library, never on the card)
+# --------------------------------------------------------------------------- #
+CARDS_NAME = "cards.json"
+_vol_cache: dict[str, tuple[str, str]] = {}
+
+
+def volume_root(p: Path) -> Path:
+    p = Path(os.path.abspath(p))
+    if os.name == "nt":
+        return Path(p.anchor)
+    parts = p.parts
+    if sys.platform == "darwin" and len(parts) >= 3 and parts[1] == "Volumes":
+        return Path(*parts[:3])
+    if len(parts) >= 4 and parts[1] in ("media", "run"):
+        return Path(*parts[:4])
+    if len(parts) >= 3 and parts[1] == "mnt":
+        return Path(*parts[:3])
+    return Path("/")
+
+
+def volume_id(root: Path) -> tuple[str, str]:
+    """(id, name) of the card or drive. On Windows the id is the volume serial number, which
+    stays the same until the card is formatted. Only reads it; nothing is written."""
+    key = str(root)
+    if key in _vol_cache:
+        return _vol_cache[key]
+    vid, name = "", ""
+    if os.name == "nt":
+        try:
+            import ctypes
+            label = ctypes.create_unicode_buffer(261)
+            fs = ctypes.create_unicode_buffer(261)
+            serial = ctypes.c_uint32()
+            r = str(root) if str(root).endswith("\\") else str(root) + "\\"
+            if ctypes.windll.kernel32.GetVolumeInformationW(r, label, 261, ctypes.byref(serial), None, None, fs, 261):
+                vid = f"{serial.value:08X}"
+                name = label.value
+        except Exception:
+            pass
+        letter = str(root).rstrip("\\")
+        name = f"{name} ({letter})" if name else letter
+    else:
+        name = root.name or str(root)
+    if not vid:
+        vid = "path:" + str(root)
+    _vol_cache[key] = (vid, name)
+    return vid, name
+
+
+def source_key(p: Path) -> tuple[str, str, str]:
+    """(card id, card name, path on the card) for a source file."""
+    root = volume_root(p)
+    vid, name = volume_id(root)
+    try:
+        rel = Path(os.path.abspath(p)).relative_to(root).as_posix()
+    except ValueError:
+        rel = Path(p).as_posix()
+    return vid, name, rel
+
+
+class CardStore:
+    """What was backed up from each card, kept in the library's .millesime folder."""
+
+    def __init__(self, lib: Path):
+        self.file = lib / META_NAME / CARDS_NAME
+        self.cards: dict[str, dict] = {}
+        try:
+            self.cards = json.loads(self.file.read_text("utf-8")).get("cards", {})
+        except Exception:
+            pass
+
+    def lookup(self, it: Item) -> list | None:
+        c = self.cards.get(it.source_id)
+        rec = c and c.get("files", {}).get(it.source_rel)
+        # same card, same path, same size and same modified time: the same file as last time
+        if rec and rec[0] == it.size and rec[1] == it.mtime_ns:
+            return rec
+        return None
+
+    def apply(self, it: Item, rec: list) -> None:
+        it.known_dest = rec[2]
+        try:
+            it.taken = datetime.fromisoformat(rec[3]) if rec[3] else None
+        except ValueError:
+            it.taken = None
+        it.date_source, it.artist, it.album = rec[4], rec[5], rec[6]
+
+    def record(self, it: Item, name: str) -> None:
+        if not it.source_id or it.status not in ("Copied", "Copied (renamed)", "Duplicate") or not it.dest:
+            return
+        c = self.cards.setdefault(it.source_id, {"name": name, "first": datetime.now().isoformat(timespec="seconds"),
+                                                 "files": {}})
+        c["name"] = name or c.get("name", "")
+        c["last"] = datetime.now().isoformat(timespec="seconds")
+        c["files"][it.source_rel] = [it.size, it.mtime_ns, it.dest,
+                                     it.taken.isoformat(timespec="seconds") if it.taken else "",
+                                     it.date_source, it.artist, it.album]
+
+    def last_backup(self, source_id: str) -> datetime | None:
+        c = self.cards.get(source_id)
+        try:
+            return datetime.fromisoformat(c["last"]) if c and c.get("last") else None
+        except ValueError:
+            return None
+
+    def save(self) -> None:
+        try:
+            self.file.parent.mkdir(parents=True, exist_ok=True)
+            _hide(self.file.parent)
+            tmp = self.file.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"version": 1, "cards": self.cards}), "utf-8")
+            tmp.replace(self.file)
+        except Exception as e:
+            log_error("Saving the card list", e)
+
+
+# --------------------------------------------------------------------------- #
+# Health check: re-read the library and compare with the checksums stored when files were copied
+# --------------------------------------------------------------------------- #
+def health_check(lib: Path, progress=lambda done, total, name: None, cancel=lambda: False) -> dict:
+    """Only reads the library drive. Returns counts and lists of damaged / missing files.
+    A file whose size or modified time changed was edited on purpose, so it isn't called damaged;
+    its new checksum is stored. A damaged file keeps its original checksum so it stays flagged."""
+    index = DestIndex(lib)
+    previous: dict[str, list] = {}
+    try:
+        previous = json.loads(index.file.read_text("utf-8")).get("files", {})
+    except Exception:
+        pass
+    index.build(cancel=cancel)
+    rels = list(index.info)
+    total = len(rels)
+    ok = new = edited = 0
+    damaged: list[str] = []
+    unreadable: list[str] = []
+    for i, rel in enumerate(rels):
+        if cancel():
+            raise Cancelled()
+        progress(i, total, rel)
+        rec = index.info[rel]
+        try:
+            h = file_hash(lib / rel, cancel)
+        except Cancelled:
+            raise
+        except OSError:
+            unreadable.append(rel)
+            continue
+        if rec[2]:
+            if h == rec[2]:
+                ok += 1
+            else:
+                damaged.append(rel)
+            continue
+        if rel in previous:
+            edited += 1
+        else:
+            new += 1
+        rec[2] = h
+        if (i + 1) % 500 == 0:
+            index.save()
+    missing = sorted(set(previous) - set(index.info))
+    index.save()
+    progress(total, total, "")
+    try:
+        d = lib / META_NAME / LOGS_NAME
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"health-check_{datetime.now():%Y-%m-%d_%H%M%S}.csv"
+        with p.open("w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["Problem", "File"])
+            for r in damaged:
+                w.writerow(["Damaged (changed without being edited)", r])
+            for r in unreadable:
+                w.writerow(["Couldn't be read", r])
+            for r in missing:
+                w.writerow(["Missing (was in the library before)", r])
+    except Exception as e:
+        log_error("Writing the health check report", e)
+        p = None
+    try:
+        meta = lib / META_NAME / "health.json"
+        meta.write_text(json.dumps({"last": datetime.now().isoformat(timespec="seconds"),
+                                    "damaged": len(damaged)}), "utf-8")
+    except Exception:
+        pass
+    return {"ok": ok, "new": new, "edited": edited, "damaged": damaged, "unreadable": unreadable,
+            "missing": missing, "report": p, "total": total}
+
+
+def last_health_check(lib: Path) -> datetime | None:
+    try:
+        return datetime.fromisoformat(json.loads((lib / META_NAME / "health.json").read_text("utf-8"))["last"])
+    except Exception:
+        return None

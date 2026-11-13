@@ -65,7 +65,7 @@ together under `Unknown Artist` and the name of the folder they came from. `cove
 
 ## The safety rules
 
-- **Your cards and old drives are only read.** Nothing on them is moved, renamed or deleted.
+- **Your cards and old drives are only read.** Nothing on them is moved, renamed, deleted or written.
 - **Nothing in the library is ever overwritten.** A different file with the same name is saved
   with a number: `IMG_0001_1.CR2`, `IMG_0001_2.CR2`, …
 - **Duplicates are exact copies only.** A file is skipped only if it's byte-for-byte identical to
@@ -76,6 +76,26 @@ together under `Unknown Artist` and the name of the folder they came from. `cove
   shown as an error; press **Start copying** again to retry those.
 - **Stopping is safe.** Press **Stop** (or close the window) any time; nothing is left
   half-copied. Drop the same cards again later and it carries on, skipping what's already there.
+
+## Backing up the same cards again
+
+Millésime remembers every card it has backed up (in the library's hidden `.millesime` folder,
+**never on the card**). When you drop a card again, a note above the list says when it was last
+backed up and how many files are new since then. Files it already backed up (same place on the
+card, same size, same date) are skipped **without being opened at all**, so a repeat backup only
+reads the card's list of files plus the new ones. Cards are recognised by their volume serial
+number, which only changes if the card is formatted.
+
+Your cards are never written to: no index files, no markers, nothing. They are only read.
+
+## Health check
+
+**Tools › Check the library for damaged files…** re-reads every file in the library and compares
+it with the checksum saved when it was copied. It reports files that have changed without being
+edited (a sign the drive is failing), files that can't be read, and files that have gone missing.
+Files you edited on purpose (new date or size) aren't called damaged; their new checksum is saved.
+It only reads the library drive, changes nothing, can be stopped at any time, and saves a report in
+the sort logs. Running it every few months is a good habit for a backup drive.
 
 ## Dates
 

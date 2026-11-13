@@ -38,6 +38,7 @@ def open_path(p: Path):
 class ScanWorker(QThread):
     found = Signal(list)          # batches of Items, already given their folders
     status = Signal(str)
+    cards = Signal(list)          # [(name, already backed up, new, last backup or None)]
 
     def __init__(self, paths, settings, dest):
         super().__init__()
@@ -46,12 +47,23 @@ class ScanWorker(QThread):
 
     def run(self):
         albums: dict = {}
+        store = engine.CardStore(self.dest)
+        per_card: dict[str, list] = {}
         batch, n, last = [], 0, time.monotonic()
         try:
             for it in engine.gather(self.paths, self.settings, self.dest, lambda: self.stop):
                 if self.stop:
                     break
-                engine.read_info(it, self.settings)
+                it.source_id, name, it.source_rel = engine.source_key(it.src)
+                c = per_card.setdefault(it.source_id, [name, 0, 0])
+                rec = store.lookup(it)
+                if rec:
+                    store.apply(it, rec)     # known file: its date is remembered, nothing is read from it
+                    it.note = "Backed up before"
+                    c[1] += 1
+                else:
+                    engine.read_info(it, self.settings)
+                    c[2] += 1
                 batch.append(it)
                 n += 1
                 if time.monotonic() - last > 0.25:
@@ -65,6 +77,7 @@ class ScanWorker(QThread):
         if batch:
             engine.plan(batch, self.settings, albums)
             self.found.emit(batch)
+        self.cards.emit([(name, known, new, store.last_backup(cid)) for cid, (name, known, new) in per_card.items()])
 
 
 class CopyWorker(QThread):
@@ -133,6 +146,33 @@ class CopyWorker(QThread):
             engine.keep_awake(False)
             if done_items:
                 self.log_path = engine.write_log(self.dest, done_items, started)
+                try:
+                    store = engine.CardStore(self.dest)
+                    for it in done_items:
+                        store.record(it, engine.source_key(it.src)[1] if it.source_id else "")
+                    store.save()
+                except Exception as e:
+                    engine.log_error("Remembering cards", e)
+
+
+class HealthWorker(QThread):
+    progress = Signal(int, int, str)
+
+    def __init__(self, lib):
+        super().__init__()
+        self.lib, self.stop, self.result, self.error, self.cancelled = lib, False, {}, "", False
+
+    def run(self):
+        engine.keep_awake(True)
+        try:
+            self.result = engine.health_check(self.lib, self.progress.emit, lambda: self.stop)
+        except engine.Cancelled:
+            self.cancelled = True
+        except Exception as e:
+            engine.log_error("Health check", e)
+            self.error = str(e)
+        finally:
+            engine.keep_awake(False)
 
 
 class UpdateCheckWorker(QThread):
@@ -307,6 +347,7 @@ class MainWindow(QMainWindow):
         self.settings = engine.load_settings()
         self.scanners: list[ScanWorker] = []
         self.copier: CopyWorker | None = None
+        self.healer: HealthWorker | None = None
         self._upd_check = None
         self._upd_apply = None
         self._copy_t0 = 0.0
@@ -384,6 +425,12 @@ class MainWindow(QMainWindow):
         g.setColumnStretch(3, 1)
         v.addWidget(box)
 
+        self.cards_label = QLabel()
+        self.cards_label.setWordWrap(True)
+        self.cards_label.setStyleSheet("background: rgba(43,123,214,0.12); border-radius: 6px; padding: 6px;")
+        self.cards_label.hide()
+        v.addWidget(self.cards_label)
+
         self.drop = DropZone()
         self.drop.dropped.connect(self.add_paths)
         v.addWidget(self.drop)
@@ -452,6 +499,11 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         a = QAction("Quit", self)
         a.triggered.connect(self.close)
+        m.addAction(a)
+
+        m = self.menuBar().addMenu("&Tools")
+        a = QAction("Check the library for damaged files…", self)
+        a.triggered.connect(self.health_check)
         m.addAction(a)
 
         m = self.menuBar().addMenu("&Help")
@@ -582,6 +634,9 @@ class MainWindow(QMainWindow):
             self.add_paths([Path(d)])
 
     def add_paths(self, paths):
+        if self.healer:
+            self.status.setText("The health check is running. Drop files when it's finished (or press Stop).")
+            return
         dest = self.dest()
         if not dest:
             QMessageBox.information(self, APP_NAME, "First choose the library folder on the new drive "
@@ -595,6 +650,7 @@ class MainWindow(QMainWindow):
             return
         s = ScanWorker(paths, self.settings, dest)
         s.found.connect(self._found)
+        s.cards.connect(self._cards_seen)
         s.status.connect(lambda t: self.copier is None and self.status.setText(t))
         s.finished.connect(lambda: self._scan_done(s))
         self.scanners.append(s)
@@ -610,6 +666,19 @@ class MainWindow(QMainWindow):
         if self.copier and rows:
             self.copier.queue.extend(rows)      # joins the copy that's already running
         self._update_summary()
+
+    def _cards_seen(self, cards):
+        lines = []
+        for name, known, new, last in cards:
+            if known and last:
+                lines.append(f"<b>{name}</b> was backed up on {last:%b %d, %Y}: {new:,} new file"
+                             f"{'' if new == 1 else 's'} since then. {known:,} already backed up will be "
+                             "skipped without reading them.")
+            elif new:
+                lines.append(f"<b>{name}</b>: first backup to this library ({new:,} files).")
+        if lines:
+            self.cards_label.setText("<br>".join(lines))
+            self.cards_label.show()
 
     def _scan_done(self, s):
         if s in self.scanners:
@@ -647,6 +716,7 @@ class MainWindow(QMainWindow):
         if self.copier or self.scanners:
             return
         self.model.clear()
+        self.cards_label.hide()
         self._update_summary()
         self.status.setText("")
         self._update_buttons()
@@ -669,7 +739,7 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- copying
     def start(self):
-        if self.copier:
+        if self.copier or self.healer:
             return
         dest = self.dest()
         if not dest or not dest.exists():
@@ -693,7 +763,8 @@ class MainWindow(QMainWindow):
             pass
         for r in rows:
             it = self.model.items[r]
-            it.status, it.note, it.dest = "Waiting", "", ""
+            it.status, it.dest = "Waiting", ""
+            it.note = "Backed up before" if it.known_dest else ""
         engine.plan([self.model.items[r] for r in rows], self.settings, {})
         self.model.refresh_all()
         c = self.copier = CopyWorker(self.model.items, rows, dest, lambda: bool(self.scanners))
@@ -726,6 +797,8 @@ class MainWindow(QMainWindow):
         self.bar.setFormat(f"{done:,} of {total:,} · {engine.human_size(rate)}/s{left}")
 
     def cancel(self):
+        if self.healer:
+            self.healer.stop = True
         if self.copier:
             self.copier.stop = True
             self.status.setText("Stopping after the current file… (nothing half-copied is left behind)")
@@ -769,8 +842,79 @@ class MainWindow(QMainWindow):
         elif b_log is not None and clicked is b_log:
             open_path(c.log_path)
 
+    # ----------------------------------------------------------- health check
+    def health_check(self):
+        if self.copier or self.healer:
+            return
+        lib = self.dest()
+        if not lib or not lib.exists():
+            QMessageBox.warning(self, APP_NAME, "Choose the library folder (and connect its drive) first.")
+            return
+        last = engine.last_health_check(lib)
+        when = f"It was last checked on {last:%b %d, %Y}." if last else "It hasn't been checked before."
+        if QMessageBox.question(
+                self, "Check the library",
+                f"This re-reads every file in {lib} and compares it with the checksum saved when it was "
+                f"copied, to catch files the drive has damaged. {when}\n\nIt only reads the library drive "
+                "(never your cards), changes nothing, and can take a while on a big library. You can stop "
+                "it any time. Start?") != QMessageBox.Yes:
+            return
+        w = self.healer = HealthWorker(lib)
+        w.progress.connect(self._health_progress)
+        w.finished.connect(self._health_done)
+        self.bar.setRange(0, 1)
+        self.bar.setValue(0)
+        self.bar.setFormat("Getting ready…")
+        self.bar.show()
+        self.status.setText("Checking the library…")
+        self._update_buttons()
+        w.start()
+
+    def _health_progress(self, done, total, name):
+        self.bar.setRange(0, max(1, total))
+        self.bar.setValue(done)
+        self.bar.setFormat(f"Checked {done:,} of {total:,}")
+        if name:
+            self.status.setText(f"Checking {name}")
+
+    def _health_done(self):
+        w = self.healer
+        self.healer = None
+        self.bar.hide()
+        self._update_buttons()
+        if w.cancelled:
+            self.status.setText("Health check stopped.")
+            return
+        if w.error:
+            self.status.setText("The health check didn't finish.")
+            QMessageBox.warning(self, "Health check", f"The health check didn't finish:\n\n{w.error}")
+            return
+        r = w.result
+        bad = len(r["damaged"]) + len(r["unreadable"])
+        msg = f"Checked {r['total']:,} files.\n\n{r['ok']:,} are exactly as they were when copied."
+        if r["new"]:
+            msg += f"\n{r['new']:,} hadn't been checked before; their checksums are saved for next time."
+        if r["edited"]:
+            msg += f"\n{r['edited']:,} were edited since (new date or size), so their new checksum was saved."
+        if r["damaged"]:
+            msg += (f"\n\n{len(r['damaged']):,} have changed without being edited. The drive may be failing: "
+                    "copy those again from your cards, and consider replacing the drive.")
+        if r["unreadable"]:
+            msg += f"\n{len(r['unreadable']):,} couldn't be read."
+        if r["missing"]:
+            msg += f"\n{len(r['missing']):,} that were in the library before are gone (deleted or moved)."
+        if not bad:
+            msg += "\n\nNo damage found."
+        self.status.setText(msg.replace("\n\n", "  ").replace("\n", " · "))
+        box = QMessageBox(QMessageBox.Warning if bad else QMessageBox.Information, "Health check", msg, parent=self)
+        b_rep = box.addButton("Open report", QMessageBox.ActionRole) if (bad or r["missing"]) and r["report"] else None
+        box.addButton(QMessageBox.Close)
+        box.exec()
+        if b_rep is not None and box.clickedButton() is b_rep:
+            open_path(r["report"])
+
     def _update_buttons(self):
-        busy = bool(self.copier)
+        busy = bool(self.copier) or bool(self.healer)
         scanning = bool(self.scanners)
         waiting = any(it.status in ("Waiting", "Error") for it in self.model.items)
         self.b_start.setEnabled(not busy and not scanning and waiting)
@@ -794,6 +938,9 @@ class MainWindow(QMainWindow):
         for s in self.scanners:
             s.stop = True
             s.wait(3000)
+        if self.healer:
+            self.healer.stop = True
+            self.healer.wait(5000)
         engine.save_settings(self.settings)
         e.accept()
 
