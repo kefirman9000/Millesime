@@ -128,6 +128,8 @@ DEFAULT_SETTINGS = {
     "no_date": "file_date",       # or "undated"
     "auto_start": False,
     "check_updates": True,
+    "only": "all",                # "all" (use the Include boxes), "raw" (RAW files only) or "custom"
+    "only_exts": "",              # custom: file types to copy, e.g. "cr2, nef, jpg" ("raw" = every RAW type)
     "min_photo_kb": 30,           # skip pictures smaller than this (icons, thumbnails); 0 = keep all
     "gentle": True,               # low priority + short breaks while copying
     "break_every_min": 10,        # gentle mode: a break every … minutes
@@ -217,6 +219,39 @@ def wanted(kind: str, s: dict) -> bool:
             "other": s.get("other", False)}[kind]
 
 
+ONLY_MODES = {
+    "all": "Everything ticked under Include",
+    "raw": "RAW files only (CR2, NEF, ARW, DNG …)",
+    "custom": "Only these file types:",
+}
+
+
+def parse_exts(text: str) -> set[str]:
+    """ "cr2, .NEF  *.jpg raw" -> {".cr2", ".nef", ".jpg", <every RAW type>} """
+    out: set[str] = set()
+    for tok in re.split(r"[\s,;|]+", (text or "").lower()):
+        tok = tok.strip().lstrip("*").lstrip(".")
+        if not tok:
+            continue
+        if tok == "raw":
+            out |= RAW_EXT
+        elif tok in ("jpg", "jpeg"):
+            out |= {".jpg", ".jpeg", ".jpe"}
+        else:
+            out.add("." + tok)
+    return out
+
+
+def only_filter(s: dict) -> set[str] | None:
+    """The file types to copy when "Copy" is set to RAW only / chosen types; None = use Include."""
+    mode = s.get("only", "all")
+    if mode == "raw":
+        return set(RAW_EXT)
+    if mode == "custom":
+        return parse_exts(s.get("only_exts", ""))
+    return None
+
+
 def _inside(p: Path, root: Path | None) -> bool:
     if not root:
         return False
@@ -232,6 +267,7 @@ def gather(paths: list[Path], settings: dict, dest_root: Path | None = None, can
     """Yield Items for every wanted file under the given files/folders. Sidecars (.xmp etc.) are
     attached to the file they belong to. Anything already inside the destination is skipped."""
     seen: set[str] = set()
+    only = only_filter(settings)
     for p in paths:
         p = Path(p)
         if _inside(p, dest_root):
@@ -285,7 +321,10 @@ def gather(paths: list[Path], settings: dict, dest_root: Path | None = None, can
                 kind = kind_of(ext)
                 if kind == "photo" and has_music and (stem in ART_STEMS or stem.startswith("albumart")):
                     kind = "art"
-                if not wanted(kind, settings):
+                if only is not None:
+                    if ext not in only:
+                        continue
+                elif not wanted(kind, settings):
                     continue
                 f = d / n
                 key = os.path.normcase(os.path.abspath(f))

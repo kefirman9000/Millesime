@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
                                QMainWindow, QMessageBox, QProgressBar, QPushButton, QSystemTrayIcon,
                                QSpinBox, QTableView, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-                               QWidget, QMenu, QDialog, QDialogButtonBox, QPlainTextEdit)
+                               QWidget, QMenu, QDialog, QDialogButtonBox, QPlainTextEdit, QLineEdit)
 from PySide6.QtGui import QKeySequence, QShortcut
 
 import engine
@@ -770,6 +770,22 @@ class MainWindow(QMainWindow):
         g.addWidget(QLabel("Include:"), 0, 0)
         g.addLayout(inc, 0, 1, 1, 3)
 
+        only_row = QHBoxLayout()
+        self.only_box = _combo(engine.ONLY_MODES, self.settings.get("only", "all"))
+        self.only_box.setToolTip("Drop a whole drive and copy just its RAW files (or the types you list). "
+                                 "Files already in the library are found and skipped, so you can drop the "
+                                 "same drive again later and only new files are copied. Sidecars (.xmp) "
+                                 "still travel with their photo.")
+        self.only_exts = QLineEdit(self.settings.get("only_exts", ""))
+        self.only_exts.setPlaceholderText("e.g.  cr2, nef, jpg   (\"raw\" = every RAW type)")
+        self.only_exts.setToolTip("File endings separated by commas or spaces. Type raw for every RAW type.")
+        self.only_box.currentIndexChanged.connect(self._options_changed)
+        self.only_exts.editingFinished.connect(self._options_changed)
+        only_row.addWidget(self.only_box)
+        only_row.addWidget(self.only_exts, 1)
+        g.addWidget(QLabel("Copy:"), 1, 0)
+        g.addLayout(only_row, 1, 1, 1, 3)
+
         self.layout_box = _combo(engine.LAYOUTS, self.settings["layout"])
         self.raw_box = _combo(engine.RAW_SPLIT, self.settings["raw_split"])
         self.camvid_box = _combo(engine.CAMERA_VIDEOS, self.settings["camera_videos"])
@@ -779,26 +795,27 @@ class MainWindow(QMainWindow):
         self.othervid_box.setToolTip("Any other videos (downloads, movies, screen recordings).")
         self.nodate_box = _combo({"file_date": "Use the file's date (what the camera saved)",
                                   "undated": "Put it in an \"Undated\" folder"}, self.settings["no_date"])
-        g.addWidget(QLabel("Photo folders:"), 1, 0)
-        g.addWidget(self.layout_box, 1, 1)
-        g.addWidget(QLabel("RAW / JPEG:"), 1, 2)
-        g.addWidget(self.raw_box, 1, 3)
-        g.addWidget(QLabel("Camera videos:"), 2, 0)
-        g.addWidget(self.camvid_box, 2, 1)
-        g.addWidget(QLabel("Other videos:"), 2, 2)
-        g.addWidget(self.othervid_box, 2, 3)
-        g.addWidget(QLabel("No date inside:"), 3, 0)
-        g.addWidget(self.nodate_box, 3, 1)
+        g.addWidget(QLabel("Photo folders:"), 2, 0)
+        g.addWidget(self.layout_box, 2, 1)
+        g.addWidget(QLabel("RAW / JPEG:"), 2, 2)
+        g.addWidget(self.raw_box, 2, 3)
+        g.addWidget(QLabel("Camera videos:"), 3, 0)
+        g.addWidget(self.camvid_box, 3, 1)
+        g.addWidget(QLabel("Other videos:"), 3, 2)
+        g.addWidget(self.othervid_box, 3, 3)
+        g.addWidget(QLabel("No date inside:"), 4, 0)
+        g.addWidget(self.nodate_box, 4, 1)
         self.c_auto = QCheckBox("Start copying as soon as I drop files")
         self.c_auto.setChecked(self.settings.get("auto_start", False))
-        g.addWidget(self.c_auto, 3, 2, 1, 2)
+        g.addWidget(self.c_auto, 4, 2, 1, 2)
         for c in (self.layout_box, self.raw_box, self.camvid_box, self.othervid_box, self.nodate_box):
             c.currentIndexChanged.connect(self._options_changed)
         self.c_auto.toggled.connect(self._options_changed)
         self.example = QLabel()
         self.example.setStyleSheet("color: gray")
         self.example.setWordWrap(True)
-        g.addWidget(self.example, 4, 0, 1, 4)
+        g.addWidget(self.example, 5, 0, 1, 4)
+        self._sync_only()
         g.setColumnStretch(1, 1)
         g.setColumnStretch(3, 1)
         v.addWidget(box)
@@ -1036,22 +1053,33 @@ class MainWindow(QMainWindow):
         old_inc = {k: self.settings.get(k) for k in self.includes}
         old_nodate = self.settings.get("no_date")
         old_tiny = self.settings.get("min_photo_kb")
+        old_only = (self.settings.get("only"), self.settings.get("only_exts"))
         for k, c in self.includes.items():
             self.settings[k] = c.isChecked()
         self.settings.update(layout=self.layout_box.currentData(), raw_split=self.raw_box.currentData(),
                              camera_videos=self.camvid_box.currentData(),
                              other_videos=self.othervid_box.currentData(),
                              no_date=self.nodate_box.currentData(), auto_start=self.c_auto.isChecked(),
-                             min_photo_kb=self.tiny_box.value())
+                             min_photo_kb=self.tiny_box.value(), only=self.only_box.currentData(),
+                             only_exts=self.only_exts.text().strip())
+        self._sync_only()
         engine.save_settings(self.settings)
         changed_scan = (old_inc != {k: self.settings[k] for k in self.includes}
                         or old_nodate != self.settings["no_date"]
-                        or old_tiny != self.settings["min_photo_kb"])
+                        or old_tiny != self.settings["min_photo_kb"]
+                        or old_only != (self.settings["only"], self.settings["only_exts"]))
         if changed_scan and self.model.items and not self.copier:
             self.status.setText("Include / date settings changed. Clear the list and drop the folders again "
                                 "to use them for these files.")
         self._show_example()
         self._replan()
+
+    def _sync_only(self):
+        """Include boxes don't apply while copying only RAW / chosen types."""
+        mode = self.only_box.currentData()
+        self.only_exts.setVisible(mode == "custom")
+        for k in ("photos", "videos", "music", "docs", "other"):
+            self.includes[k].setEnabled(mode == "all")
 
     def _replan(self):
         """Update where waiting files will go after a folder option changes."""
@@ -1148,7 +1176,7 @@ class MainWindow(QMainWindow):
             return
         waiting = sum(1 for it in self.model.items if it.status == "Waiting")
         if not waiting:
-            self.status.setText("Nothing new to copy there (check the Include boxes above).")
+            self.status.setText("Nothing new to copy there (check Include / Copy above, or it was all copied already).")
             return
         self.status.setText(f"{waiting:,} files ready. Check the list, then press Start copying.")
         if self.settings.get("auto_start"):

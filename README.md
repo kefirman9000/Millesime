@@ -51,6 +51,15 @@ Before you copy, the **Where files will go** tab shows the folders your files wi
 tree, with how many files and how much space each takes, e.g. `Photos › 2019 › 07 - July (212)`.
 The **All files** tab lists every file. Double-click a folder to open it.
 
+## Copy only RAW files (or chosen types)
+
+Set **Copy:** (under Include) to **RAW files only**, or to **Only these file types:** and type the
+endings you want, e.g. `cr2, nef, jpg` (`raw` means every RAW type). Then drop a whole drive on the
+window: Millésime digs through every folder on it, picks out just those files, and skips any that
+are already in your library, so you can drop the same drive again later and only new files get
+copied. Sidecars such as `.xmp` still travel with their photo. Set it back to **Everything ticked
+under Include** to use the Include boxes again.
+
 ## Naming, moving and skipping
 
 You're never asked to name anything, but you can, right in the **Where files will go** tree:
