@@ -159,6 +159,40 @@ recording date of MP4/MOV videos. Rows that fell back to the file's own date are
 - **File › Make a desktop shortcut** puts a Millésime icon on your desktop.
 - The window remembers its size, position, column widths and which tab you were on.
 
+## Reliability and big jobs
+
+- **Progress inside big files.** The status line shows how far through a big file it is
+  (`Copying MVI_0042.MOV · 3.1 GB of 12.4 GB`, then `Checking the copy of …`), so a long video never
+  looks stuck.
+- **Unplugged drives.** If the library drive is unplugged, copying stops cleanly and says so. If a
+  card is pulled out, its remaining files wait while the others carry on. Plug it back in and
+  press **Start copying** to finish.
+- **Full drives.** It always leaves 2 GB free and stops cleanly before the drive fills.
+- **Flaky card readers.** A file that can't be read is tried again twice before it's marked as an
+  error.
+- **Very long paths.** Files deep in long-named folders (common in Music) are handled past
+  Windows' usual 260-character limit.
+- **Checks before copying.** It warns if the library is on the drive Windows runs from (not much of
+  a backup), if the drive is FAT32 and can't hold files of 4 GB or more, or if files are already on
+  the library drive.
+- **One window per library.** A second Millésime window can't copy into the same library at the
+  same time.
+- **Crash-safe records.** What's in the library, its checksums and which cards were backed up are
+  kept in a small database in `.millesime` that survives crashes and power cuts, with a dated
+  backup copy (the last 5 are kept). The sort log is written as it goes. Half-finished copies left
+  by a crash are cleaned up on the next run (only the program's own temporary files).
+- **Large libraries.** Only what changed is saved, so libraries with hundreds of thousands of files
+  stay quick.
+
+## When something goes wrong
+
+**Help › Report a problem…** makes a report: version, settings, what it was doing, recent errors
+and, if something is frozen, exactly where each part of the program is stuck. Your Windows user
+name is hidden. **Copy to clipboard** or **Save to desktop**, then send it with a sentence about
+what happened. If nothing moves for 5 minutes, that "where it's stuck" snapshot is saved
+automatically, and if the program ever crashes outright, `data/crash.log` records where.
+**Help › Open the error log** shows the raw log.
+
 ## Updates
 
 Millésime checks GitHub for a newer **release** when it opens and **only downloads it if you say

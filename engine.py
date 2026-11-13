@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -27,6 +28,9 @@ import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+# the date reader prints "PNG file does not have exif data" etc. for files without dates: not errors
+logging.getLogger("exifread").setLevel(logging.CRITICAL)
 
 APP_NAME = "Millésime"
 APP_DIR = Path(__file__).resolve().parent
@@ -157,7 +161,7 @@ def log_error(where: str, e: BaseException | str) -> None:
 # --------------------------------------------------------------------------- #
 # Finding files
 # --------------------------------------------------------------------------- #
-@dataclass
+@dataclass(slots=True)
 class Item:
     src: Path
     size: int
@@ -313,7 +317,7 @@ def _exifread_date(path: Path) -> datetime | None:
     except Exception:
         return None
     try:
-        with path.open("rb") as f:
+        with open(L(path), "rb") as f:
             tags = exifread.process_file(f, details=False, stop_tag="DateTimeOriginal")
         for t in ("EXIF DateTimeOriginal", "EXIF DateTimeDigitized", "Image DateTime"):
             v = tags.get(t)
@@ -332,7 +336,7 @@ def _scan_date(path: Path) -> datetime | None:
     """EXIF dates are stored as text ("2019:07:04 15:30:12") near the start of almost every RAW
     and JPEG (CR3, RAF and others included), so this finds them even where EXIF readers can't."""
     try:
-        with path.open("rb") as f:
+        with open(L(path), "rb") as f:
             blob = f.read(_SCAN_BYTES)
     except OSError:
         return None
@@ -364,8 +368,8 @@ def _mp4_date_fixed(path: Path) -> datetime | None:
 
 def _mp4_secs(path: Path) -> int:
     try:
-        with path.open("rb") as f:
-            stop_all = path.stat().st_size
+        with open(L(path), "rb") as f:
+            stop_all = os.fstat(f.fileno()).st_size
 
             def boxes(start, stop):
                 pos = start
@@ -456,7 +460,7 @@ def read_music_tags(path: Path) -> tuple[str, str]:
     """(artist, album) from the song's tags, preferring the album artist so albums stay together."""
     try:
         import mutagen  # type: ignore
-        f = mutagen.File(path, easy=True)
+        f = mutagen.File(L(path), easy=True)
     except Exception:
         return "", ""
     if not f or not getattr(f, "tags", None):
@@ -561,14 +565,143 @@ KIND_LABEL = {"raw": "RAW", "photo": "Photo", "video": "Video", "music": "Music"
 
 
 # --------------------------------------------------------------------------- #
-# Checksums and what's already on the destination
+# Long Windows paths, file systems, free space
 # --------------------------------------------------------------------------- #
 CHUNK = 4 * 1024 * 1024
+RESERVE_BYTES = 2 * 1024 ** 3          # always leave this much free on the library drive
+FAT_LIMIT = 4 * 1024 ** 3 - 1          # FAT32 can't hold a file this big or bigger
 
 
-def file_hash(path: Path, cancel=lambda: False) -> str:
+def L(p) -> str:
+    """Path string that works past Windows' 260-character limit."""
+    s = os.path.abspath(str(p))
+    if os.name != "nt" or s.startswith("\\\\?\\") or len(s) < 240:
+        return s
+    if s.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + s[2:]
+    return "\\\\?\\" + s
+
+
+def exists(p) -> bool:
+    return os.path.exists(L(p))
+
+
+def fs_type(p: Path) -> str:
+    """'NTFS', 'exFAT', 'FAT32' … for the drive p is on ('' if unknown)."""
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        fs = ctypes.create_unicode_buffer(261)
+        root = str(volume_root(p))
+        root = root if root.endswith("\\") else root + "\\"
+        if ctypes.windll.kernel32.GetVolumeInformationW(root, None, 0, None, None, None, fs, 261):
+            return fs.value
+    except Exception:
+        pass
+    return ""
+
+
+def free_bytes(p: Path) -> int:
+    try:
+        return shutil.disk_usage(L(p)).free
+    except OSError:
+        return -1
+
+
+class DriveFull(Exception):
+    pass
+
+
+class DriveGone(Exception):
+    """The library drive (or the card a file was on) has been unplugged."""
+
+
+def is_disk_full(e: BaseException) -> bool:
+    return isinstance(e, OSError) and (getattr(e, "errno", None) == 28 or getattr(e, "winerror", None) in (39, 112))
+
+
+# --------------------------------------------------------------------------- #
+# The library's own records: a small database in .millesime (crash-safe)
+# --------------------------------------------------------------------------- #
+DB_NAME = "library.db"
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS files (rel TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER, hash TEXT);
+CREATE TABLE IF NOT EXISTS cards (id TEXT PRIMARY KEY, name TEXT, first TEXT, last TEXT);
+CREATE TABLE IF NOT EXISTS card_files (card TEXT, rel TEXT, size INTEGER, mtime_ns INTEGER, dest TEXT,
+    taken TEXT, date_source TEXT, artist TEXT, album TEXT, PRIMARY KEY (card, rel));
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+def open_db(lib: Path):
+    """One connection per thread. WAL mode keeps the records intact through crashes and power cuts."""
+    import sqlite3
+    meta = lib / META_NAME
+    os.makedirs(L(meta), exist_ok=True)
+    _hide(meta)
+    con = sqlite3.connect(L(meta / DB_NAME), timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.executescript(_SCHEMA)
+    _migrate_json(con, meta)
+    return con
+
+
+def _migrate_json(con, meta: Path):
+    """Bring in the records older versions kept as JSON (the JSON files are left where they are)."""
+    if con.execute("SELECT value FROM meta WHERE key='migrated'").fetchone():
+        return
+    try:
+        files = json.loads((meta / INDEX_NAME).read_text("utf-8")).get("files", {})
+        con.executemany("INSERT OR IGNORE INTO files VALUES (?,?,?,?)",
+                        [(r, v[0], v[1], v[2] or "") for r, v in files.items()])
+    except Exception:
+        pass
+    try:
+        cards = json.loads((meta / "cards.json").read_text("utf-8")).get("cards", {})
+        for cid, c in cards.items():
+            con.execute("INSERT OR IGNORE INTO cards VALUES (?,?,?,?)",
+                        (cid, c.get("name", ""), c.get("first", ""), c.get("last", "")))
+            con.executemany("INSERT OR IGNORE INTO card_files VALUES (?,?,?,?,?,?,?,?,?)",
+                            [(cid, rel, *v[:7]) for rel, v in c.get("files", {}).items()])
+    except Exception:
+        pass
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('migrated', ?)", (datetime.now().isoformat(),))
+    con.commit()
+
+
+def backup_db(lib: Path, keep: int = 5) -> None:
+    """A dated copy of the records (one a day, last few kept), in case the drive damages the live one."""
+    try:
+        import sqlite3
+        d = lib / META_NAME / "backups"
+        os.makedirs(L(d), exist_ok=True)
+        target = d / f"library-{datetime.now():%Y-%m-%d}.db"
+        src = open_db(lib)
+        dst = sqlite3.connect(L(target))
+        with dst:
+            src.backup(dst)
+        dst.close()
+        src.close()
+        olds = sorted(d.glob("library-*.db"))
+        for f in olds[:-keep]:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    except Exception as e:
+        log_error("Backing up the library records", e)
+
+
+# --------------------------------------------------------------------------- #
+# Checksums and what's already in the library
+# --------------------------------------------------------------------------- #
+def file_hash(path: Path, cancel=lambda: False, on_bytes=None) -> str:
     h = hashlib.blake2b(digest_size=20)
-    with path.open("rb") as f:
+    done = 0
+    with open(L(path), "rb") as f:
+        total = os.fstat(f.fileno()).st_size
         while True:
             if cancel():
                 raise Cancelled()
@@ -576,6 +709,9 @@ def file_hash(path: Path, cancel=lambda: False) -> str:
             if not b:
                 break
             h.update(b)
+            done += len(b)
+            if on_bytes and total > 64 * CHUNK:
+                on_bytes(done, total)
     return h.hexdigest()
 
 
@@ -583,57 +719,98 @@ class Cancelled(Exception):
     pass
 
 
+def walk_files(root: Path, cancel=lambda: False):
+    """Yield (relative path, size, mtime_ns) for every file under root, fast (one directory read
+    gives the sizes on Windows) and safe with very long paths. Skips the .millesime folder."""
+    stack = [""]
+    base = str(root)
+    while stack:
+        if cancel():
+            raise Cancelled()
+        rel_dir = stack.pop()
+        try:
+            it = os.scandir(L(os.path.join(base, rel_dir)) if rel_dir else L(base))
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                name = e.name
+                rel = f"{rel_dir}/{name}" if rel_dir else name
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if name.lower() not in SKIP_DIRS:
+                            stack.append(rel)
+                        continue
+                    st = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                yield rel, st.st_size, st.st_mtime_ns
+
+
 class DestIndex:
-    """Every file on the destination by size, with checksums worked out only when needed and
-    remembered in .millesime/index.json so the next run is fast."""
+    """Every file in the library by size, with checksums worked out only when needed and kept in
+    the library's records so later runs are fast."""
 
     def __init__(self, root: Path):
         self.root = root
         self.meta = root / META_NAME
-        self.file = self.meta / INDEX_NAME
+        self.file = self.meta / INDEX_NAME          # old JSON index (only read, for migrating)
         self.by_size: dict[int, list[str]] = {}
-        self.info: dict[str, list] = {}       # rel -> [size, mtime_ns, hash or ""]
-        self.taken: set[str] = set()           # lower-cased rel paths (names in use)
+        self.info: dict[str, list] = {}             # rel -> [size, mtime_ns, hash or ""]
+        self.taken: set[str] = set()                # lower-cased rel paths (names in use)
+        self.missing: list[str] = []                # in the records but no longer on the drive
+        self.leftovers = 0                          # half-copies from a crash, cleaned up
+        self._dirty: set[str] = set()
+        self._con = None
 
     def build(self, progress=lambda n: None, cancel=lambda: False):
-        cached: dict[str, list] = {}
-        try:
-            cached = json.loads(self.file.read_text("utf-8")).get("files", {})
-        except Exception:
-            pass
+        self._con = open_db(self.root)
+        cached = {r: (s, m, h) for r, s, m, h in self._con.execute("SELECT rel, size, mtime_ns, hash FROM files")}
         n = 0
-        for root, dnames, fnames in os.walk(self.root):
-            if cancel():
-                raise Cancelled()
-            dnames[:] = [d for d in dnames if d.lower() not in SKIP_DIRS]
-            for fn in fnames:
-                if fn.endswith(PART_SUFFIX):
-                    continue
-                full = Path(root) / fn
-                rel = full.relative_to(self.root).as_posix()
+        for rel, size, mtime in walk_files(self.root, cancel):
+            if rel.endswith(PART_SUFFIX):
+                # a half-written copy from a crash or power cut: ours, never a real file
                 try:
-                    st = full.stat()
+                    os.unlink(L(self.root / rel))
+                    self.leftovers += 1
                 except OSError:
-                    continue
-                c = cached.get(rel)
-                h = c[2] if c and c[0] == st.st_size and c[1] == st.st_mtime_ns else ""
-                self._add(rel, st.st_size, st.st_mtime_ns, h)
-                n += 1
-                if n % 500 == 0:
-                    progress(n)
+                    pass
+                continue
+            c = cached.pop(rel, None)
+            h = c[2] if c and c[0] == size and c[1] == mtime else ""
+            self._add(rel, size, mtime, h)
+            if not c or h != c[2] or c[0] != size or c[1] != mtime:
+                self._dirty.add(rel)
+            n += 1
+            if n % 1000 == 0:
+                progress(n)
+        self.missing = sorted(cached)
         progress(n)
 
     def _add(self, rel: str, size: int, mtime_ns: int, h: str):
+        old = self.info.get(rel)
+        if old and old[0] != size:
+            try:
+                self.by_size[old[0]].remove(rel)
+            except (KeyError, ValueError):
+                pass
         self.info[rel] = [size, mtime_ns, h]
-        self.by_size.setdefault(size, []).append(rel)
+        if not old or old[0] != size:
+            self.by_size.setdefault(size, []).append(rel)
         self.taken.add(rel.lower())
 
     def add(self, full: Path, h: str):
-        st = full.stat()
-        self._add(full.relative_to(self.root).as_posix(), st.st_size, st.st_mtime_ns, h)
+        st = os.stat(L(full))
+        rel = full.relative_to(self.root).as_posix()
+        self._add(rel, st.st_size, st.st_mtime_ns, h)
+        self._dirty.add(rel)
 
-    def find_identical(self, size: int, src_hash_fn, cancel=lambda: False) -> str | None:
-        """Relative path of a byte-identical file already on the destination, or None."""
+    def set_hash(self, rel: str, h: str):
+        self.info[rel][2] = h
+        self._dirty.add(rel)
+
+    def find_identical(self, size: int, src_hash_fn, cancel=lambda: False, on_bytes=None) -> str | None:
+        """Relative path of a byte-identical file already in the library, or None."""
         cands = self.by_size.get(size)
         if not cands:
             return None
@@ -644,35 +821,46 @@ class DestIndex:
                 continue
             if not rec[2]:
                 try:
-                    rec[2] = file_hash(self.root / rel, cancel)
+                    self.set_hash(rel, file_hash(self.root / rel, cancel, on_bytes))
                 except Cancelled:
                     raise
                 except OSError:
                     continue
-            if rec[2] == sh:
-                if (self.root / rel).exists():
-                    return rel
+            if rec[2] == sh and exists(self.root / rel):
+                return rel
         return None
 
     def name_free(self, rel: str) -> bool:
-        return rel.lower() not in self.taken and not (self.root / rel).exists()
+        return rel.lower() not in self.taken and not exists(self.root / rel)
 
-    def save(self):
+    def save(self, drop_missing: bool = True):
+        """Write only what changed since the last save (cheap, even for huge libraries)."""
         try:
-            self.meta.mkdir(parents=True, exist_ok=True)
-            _hide(self.meta)
-            tmp = self.file.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"version": 1, "files": self.info}), "utf-8")
-            tmp.replace(self.file)
+            if self._con is None:
+                self._con = open_db(self.root)
+            rows = [(r, *self.info[r]) for r in self._dirty if r in self.info]
+            with self._con:
+                self._con.executemany("INSERT OR REPLACE INTO files VALUES (?,?,?,?)", rows)
+                if drop_missing and self.missing:
+                    self._con.executemany("DELETE FROM files WHERE rel=?", [(r,) for r in self.missing])
+            self._dirty.clear()
         except Exception as e:
-            log_error("Saving the destination index", e)
+            log_error("Saving the library records", e)
+
+    def close(self):
+        if self._con is not None:
+            try:
+                self._con.close()
+            except Exception:
+                pass
+            self._con = None
 
 
 def _hide(p: Path):
     if os.name == "nt":
         try:
             import ctypes
-            ctypes.windll.kernel32.SetFileAttributesW(str(p), 0x02)
+            ctypes.windll.kernel32.SetFileAttributesW(L(p), 0x02)
         except Exception:
             pass
 
@@ -703,14 +891,15 @@ def _join(folder: str, name: str) -> str:
     return (Path(folder) / name).as_posix() if folder else name
 
 
-def safe_copy(src: Path, dest: Path, cancel=lambda: False) -> str:
+def safe_copy(src: Path, dest: Path, cancel=lambda: False, on_bytes=None) -> str:
     """Copy src to dest without ever overwriting anything, and check the copy.
     Returns the checksum. Raises on any problem (and leaves nothing half-written behind)."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.makedirs(L(dest.parent), exist_ok=True)
     tmp = dest.with_name(dest.name + PART_SUFFIX)
     h = hashlib.blake2b(digest_size=20)
     try:
-        with src.open("rb") as fi, open(tmp, "xb") as fo:
+        with open(L(src), "rb") as fi, open(L(tmp), "xb") as fo:
+            total, done = os.fstat(fi.fileno()).st_size, 0
             while True:
                 if cancel():
                     raise Cancelled()
@@ -719,21 +908,25 @@ def safe_copy(src: Path, dest: Path, cancel=lambda: False) -> str:
                     break
                 h.update(b)
                 fo.write(b)
+                done += len(b)
+                if on_bytes and total > 16 * CHUNK:
+                    on_bytes("Copying", done, total)
             fo.flush()
             os.fsync(fo.fileno())
         src_hash = h.hexdigest()
         try:
-            shutil.copystat(src, tmp)
+            shutil.copystat(L(src), L(tmp))
         except OSError:
             pass
-        if file_hash(tmp, cancel) != src_hash:
+        check = (lambda d, t: on_bytes("Checking the copy of", d, t)) if on_bytes else None
+        if file_hash(tmp, cancel, check) != src_hash:
             raise IOError("The copy didn't match the original (the card or drive may have a read/write "
                           "problem). It was not kept.")
         _place(tmp, dest)
         return src_hash
     except BaseException:
         try:
-            tmp.unlink()
+            os.unlink(L(tmp))
         except OSError:
             pass
         raise
@@ -742,7 +935,7 @@ def safe_copy(src: Path, dest: Path, cancel=lambda: False) -> str:
 def _place(tmp: Path, dest: Path):
     """Give the checked copy its real name, refusing to replace anything that's there."""
     if os.name == "nt":
-        os.rename(tmp, dest)            # raises FileExistsError instead of overwriting
+        os.rename(L(tmp), L(dest))      # raises FileExistsError instead of overwriting
         return
     try:
         os.link(tmp, dest)              # fails if dest exists
@@ -755,38 +948,68 @@ def _place(tmp: Path, dest: Path):
         os.rename(tmp, dest)
 
 
-def process(item: Item, index: DestIndex, cancel=lambda: False) -> None:
-    """Copy one item (with its sidecars). Sets item.status, item.dest and item.note."""
+class Guard:
+    """Checks made before every copy: space left, file-system limits, drive still there."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.fat = fs_type(root).upper().startswith("FAT")
+        self._free = free_bytes(root)
+        self._checked = 0.0
+
+    def before_copy(self, size: int):
+        if not exists(self.root):
+            raise DriveGone("The library drive was disconnected.")
+        if self.fat and size >= FAT_LIMIT:
+            raise IOError("This drive is formatted FAT32, which can't hold files of 4 GB or more. "
+                          "Reformat it as NTFS or exFAT to copy this one.")
+        now = time.monotonic()
+        if now - self._checked > 5 or self._free - size < RESERVE_BYTES * 2:
+            self._free = free_bytes(self.root)
+            self._checked = now
+        if self._free >= 0 and self._free - size < RESERVE_BYTES:
+            raise DriveFull(f"The library drive is almost full. {human_size(RESERVE_BYTES)} is always left free "
+                            "so the drive keeps working well.")
+        self._free -= size
+
+
+def process(item: Item, index: DestIndex, cancel=lambda: False, guard: Guard | None = None,
+            on_bytes=None) -> None:
+    """Copy one item (with its sidecars). Sets item.status, item.dest and item.note.
+    on_bytes(what, done, total) reports progress inside big files."""
     root = index.root
     cache: dict[str, str] = {}
+    say = (lambda what: (lambda d, t: on_bytes(what, d, t))) if on_bytes else (lambda what: None)
 
     def src_hash():
         if "h" not in cache:
-            cache["h"] = file_hash(item.src, cancel)
+            cache["h"] = file_hash(item.src, cancel, say("Comparing"))
         return cache["h"]
 
     if item.known_dest:
         # backed up from this card before, and still in the library: not read again
         rec = index.info.get(item.known_dest)
-        if rec and rec[0] == item.size and (root / item.known_dest).exists():
+        if rec and rec[0] == item.size and exists(root / item.known_dest):
             item.status = "Duplicate"
             item.dest = item.known_dest
             item.note = "Already backed up from this card (not read again)"
             return
 
-    same = index.find_identical(item.size, src_hash, cancel)
+    same = index.find_identical(item.size, src_hash, cancel, say("Comparing with the library's copy of"))
     if same:
         item.status = "Duplicate"
         item.dest = same
         item.note = "Already on the drive, so it wasn't copied again"
-        _copy_dup_sidecars(item, index, same, cancel)
+        _copy_dup_sidecars(item, index, same, cancel, guard)
         return
 
+    if guard:
+        guard.before_copy(item.size + sum(_size(c) for c in item.sidecars))
     name = _free_name(index, item.folder, item.src.name, item.sidecars)
     rel = _join(item.folder, name)
     for _ in range(50):
         try:
-            h = safe_copy(item.src, root / rel, cancel)
+            h = safe_copy(item.src, root / rel, cancel, on_bytes)
             break
         except FileExistsError:          # appeared meanwhile: never overwrite, pick the next number
             index.taken.add(rel.lower())
@@ -816,7 +1039,14 @@ def process(item: Item, index: DestIndex, cancel=lambda: False) -> None:
             item.note = (item.note + "; " if item.note else "") + f"sidecar {car.name} not copied: {e}"
 
 
-def _copy_dup_sidecars(item: Item, index: DestIndex, same_rel: str, cancel):
+def _size(p: Path) -> int:
+    try:
+        return os.stat(L(p)).st_size
+    except OSError:
+        return 0
+
+
+def _copy_dup_sidecars(item: Item, index: DestIndex, same_rel: str, cancel, guard: Guard | None = None):
     """A duplicate's sidecar (e.g. Lightroom edits) is copied next to the existing photo if that
     photo doesn't have one with that name yet. Nothing there is ever replaced."""
     if not item.sidecars:
@@ -828,44 +1058,81 @@ def _copy_dup_sidecars(item: Item, index: DestIndex, same_rel: str, cancel):
     for car in item.sidecars:
         crel = _join(folder, _sidecar_name(car, stem, ext, new_stem))
         target = index.root / crel
-        if target.exists():
+        if exists(target):
             try:
-                if target.stat().st_size == car.stat().st_size and file_hash(target) == file_hash(car):
+                if _size(target) == _size(car) and file_hash(target) == file_hash(car):
                     continue
             except OSError:
                 pass
             item.note += f"; a different {car.name} is already next to it, so this one was left on the card"
             continue
         try:
+            if guard:
+                guard.before_copy(_size(car))
             ch = safe_copy(car, target, cancel)
             index.add(target, ch)
             item.note += f"; copied its {car.name}"
-        except Cancelled:
+        except (Cancelled, DriveFull, DriveGone):
             raise
         except Exception as e:
             item.note += f"; sidecar {car.name} not copied: {e}"
 
 
-# --------------------------------------------------------------------------- #
-# Sort log on the destination
-# --------------------------------------------------------------------------- #
-def write_log(root: Path, items: list[Item], started: datetime) -> Path | None:
+def source_gone(it: Item) -> bool:
+    """True if the card or drive this file was on has been unplugged."""
     try:
-        d = root / META_NAME / LOGS_NAME
-        d.mkdir(parents=True, exist_ok=True)
-        _hide(root / META_NAME)
-        p = d / f"{started:%Y-%m-%d_%H%M%S}.csv"
-        with p.open("w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow(["Result", "From", "To", "Taken", "Date from", "Note"])
-            for it in items:
-                w.writerow([it.status, str(it.src), it.dest,
-                            it.taken.strftime("%Y-%m-%d %H:%M:%S") if it.taken else "",
-                            it.date_source, it.note])
-        return p
-    except Exception as e:
-        log_error("Writing the sort log", e)
-        return None
+        return not os.path.exists(str(volume_root(it.src)))
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Sort log on the destination, written as it goes (survives a crash)
+# --------------------------------------------------------------------------- #
+class LogWriter:
+    def __init__(self, root: Path, started: datetime):
+        self.path = None
+        self._f = None
+        try:
+            d = root / META_NAME / LOGS_NAME
+            os.makedirs(L(d), exist_ok=True)
+            _hide(root / META_NAME)
+            self.path = d / f"{started:%Y-%m-%d_%H%M%S}.csv"
+            self._f = open(L(self.path), "w", newline="", encoding="utf-8-sig")
+            self._w = csv.writer(self._f)
+            self._w.writerow(["Result", "From", "To", "Taken", "Date from", "Note"])
+            self._last_flush = time.monotonic()
+        except Exception as e:
+            log_error("Starting the sort log", e)
+            self._f = None
+
+    def write(self, it: Item):
+        if not self._f:
+            return
+        try:
+            self._w.writerow([it.status, str(it.src), it.dest,
+                              it.taken.strftime("%Y-%m-%d %H:%M:%S") if it.taken else "", it.date_source, it.note])
+            if time.monotonic() - self._last_flush > 2:
+                self._f.flush()
+                self._last_flush = time.monotonic()
+        except Exception:
+            pass
+
+    def close(self):
+        if self._f:
+            try:
+                self._f.close()
+            except Exception:
+                pass
+            self._f = None
+
+
+def write_log(root: Path, items: list[Item], started: datetime) -> Path | None:
+    w = LogWriter(root, started)
+    for it in items:
+        w.write(it)
+    w.close()
+    return w.path
 
 
 def human_size(n: float) -> str:
@@ -950,22 +1217,27 @@ def source_key(p: Path) -> tuple[str, str, str]:
 
 
 class CardStore:
-    """What was backed up from each card, kept in the library's .millesime folder."""
+    """What was backed up from each card, kept in the library's records (never on the card).
+    Use one CardStore per thread."""
 
     def __init__(self, lib: Path):
-        self.file = lib / META_NAME / CARDS_NAME
-        self.cards: dict[str, dict] = {}
+        self.lib = lib
+        self._con = None
+        self._pending: list[tuple] = []
+        self._cards: dict[str, str] = {}
         try:
-            self.cards = json.loads(self.file.read_text("utf-8")).get("cards", {})
-        except Exception:
-            pass
+            self._con = open_db(lib)
+        except Exception as e:
+            log_error("Opening the library records", e)
 
     def lookup(self, it: Item) -> list | None:
-        c = self.cards.get(it.source_id)
-        rec = c and c.get("files", {}).get(it.source_rel)
+        if not self._con or not it.source_id:
+            return None
+        row = self._con.execute("SELECT size, mtime_ns, dest, taken, date_source, artist, album FROM card_files "
+                                "WHERE card=? AND rel=?", (it.source_id, it.source_rel)).fetchone()
         # same card, same path, same size and same modified time: the same file as last time
-        if rec and rec[0] == it.size and rec[1] == it.mtime_ns:
-            return rec
+        if row and row[0] == it.size and row[1] == it.mtime_ns:
+            return list(row)
         return None
 
     def apply(self, it: Item, rec: list) -> None:
@@ -974,35 +1246,46 @@ class CardStore:
             it.taken = datetime.fromisoformat(rec[3]) if rec[3] else None
         except ValueError:
             it.taken = None
-        it.date_source, it.artist, it.album = rec[4], rec[5], rec[6]
+        it.date_source, it.artist, it.album = rec[4] or "", rec[5] or "", rec[6] or ""
 
     def record(self, it: Item, name: str) -> None:
         if not it.source_id or it.status not in ("Copied", "Copied (renamed)", "Duplicate") or not it.dest:
             return
-        c = self.cards.setdefault(it.source_id, {"name": name, "first": datetime.now().isoformat(timespec="seconds"),
-                                                 "files": {}})
-        c["name"] = name or c.get("name", "")
-        c["last"] = datetime.now().isoformat(timespec="seconds")
-        c["files"][it.source_rel] = [it.size, it.mtime_ns, it.dest,
-                                     it.taken.isoformat(timespec="seconds") if it.taken else "",
-                                     it.date_source, it.artist, it.album]
+        self._cards[it.source_id] = name
+        self._pending.append((it.source_id, it.source_rel, it.size, it.mtime_ns, it.dest,
+                              it.taken.isoformat(timespec="seconds") if it.taken else "",
+                              it.date_source, it.artist, it.album))
+        if len(self._pending) >= 500:
+            self.save()
 
     def last_backup(self, source_id: str) -> datetime | None:
-        c = self.cards.get(source_id)
+        if not self._con:
+            return None
+        row = self._con.execute("SELECT last FROM cards WHERE id=?", (source_id,)).fetchone()
         try:
-            return datetime.fromisoformat(c["last"]) if c and c.get("last") else None
+            return datetime.fromisoformat(row[0]) if row and row[0] else None
         except ValueError:
             return None
 
     def save(self) -> None:
+        if not self._con or (not self._pending and not self._cards):
+            return
+        now = datetime.now().isoformat(timespec="seconds")
         try:
-            self.file.parent.mkdir(parents=True, exist_ok=True)
-            _hide(self.file.parent)
-            tmp = self.file.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"version": 1, "cards": self.cards}), "utf-8")
-            tmp.replace(self.file)
+            with self._con:
+                for cid, name in self._cards.items():
+                    self._con.execute("INSERT INTO cards VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                                      "name=excluded.name, last=excluded.last", (cid, name, now, now))
+                self._con.executemany("INSERT OR REPLACE INTO card_files VALUES (?,?,?,?,?,?,?,?,?)", self._pending)
+            self._pending.clear()
         except Exception as e:
             log_error("Saving the card list", e)
+
+    def close(self):
+        self.save()
+        if self._con:
+            self._con.close()
+            self._con = None
 
 
 # --------------------------------------------------------------------------- #
@@ -1013,11 +1296,9 @@ def health_check(lib: Path, progress=lambda done, total, name: None, cancel=lamb
     A file whose size or modified time changed was edited on purpose, so it isn't called damaged;
     its new checksum is stored. A damaged file keeps its original checksum so it stays flagged."""
     index = DestIndex(lib)
-    previous: dict[str, list] = {}
-    try:
-        previous = json.loads(index.file.read_text("utf-8")).get("files", {})
-    except Exception:
-        pass
+    con = open_db(lib)
+    known = {r for (r,) in con.execute("SELECT rel FROM files")}
+    con.close()
     index.build(cancel=cancel)
     rels = list(index.info)
     total = len(rels)
@@ -1026,14 +1307,21 @@ def health_check(lib: Path, progress=lambda done, total, name: None, cancel=lamb
     unreadable: list[str] = []
     for i, rel in enumerate(rels):
         if cancel():
+            index.save(drop_missing=False)
+            index.close()
             raise Cancelled()
         progress(i, total, rel)
         rec = index.info[rel]
         try:
             h = file_hash(lib / rel, cancel)
         except Cancelled:
+            index.save(drop_missing=False)
+            index.close()
             raise
         except OSError:
+            if not exists(lib):
+                index.close()
+                raise DriveGone("The library drive was disconnected during the check.")
             unreadable.append(rel)
             continue
         if rec[2]:
@@ -1042,21 +1330,23 @@ def health_check(lib: Path, progress=lambda done, total, name: None, cancel=lamb
             else:
                 damaged.append(rel)
             continue
-        if rel in previous:
+        if rel in known:
             edited += 1
         else:
             new += 1
-        rec[2] = h
-        if (i + 1) % 500 == 0:
-            index.save()
-    missing = sorted(set(previous) - set(index.info))
+        index.set_hash(rel, h)
+        if (i + 1) % 1000 == 0:
+            index.save(drop_missing=False)
+    missing = list(index.missing)
     index.save()
+    index.close()
     progress(total, total, "")
+    p = None
     try:
         d = lib / META_NAME / LOGS_NAME
-        d.mkdir(parents=True, exist_ok=True)
+        os.makedirs(L(d), exist_ok=True)
         p = d / f"health-check_{datetime.now():%Y-%m-%d_%H%M%S}.csv"
-        with p.open("w", newline="", encoding="utf-8-sig") as f:
+        with open(L(p), "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(["Problem", "File"])
             for r in damaged:
@@ -1069,11 +1359,11 @@ def health_check(lib: Path, progress=lambda done, total, name: None, cancel=lamb
         log_error("Writing the health check report", e)
         p = None
     try:
-        meta = lib / META_NAME / "health.json"
-        meta.write_text(json.dumps({"last": datetime.now().isoformat(timespec="seconds"),
-                                    "damaged": len(damaged)}), "utf-8")
+        (lib / META_NAME / "health.json").write_text(
+            json.dumps({"last": datetime.now().isoformat(timespec="seconds"), "damaged": len(damaged)}), "utf-8")
     except Exception:
         pass
+    backup_db(lib)
     return {"ok": ok, "new": new, "edited": edited, "damaged": damaged, "unreadable": unreadable,
             "missing": missing, "report": p, "total": total}
 
@@ -1113,3 +1403,93 @@ def clean_folder_path(text: str) -> str:
     """'Photos\\Events/ Wedding ' -> 'Photos/Events/Wedding', each part made safe for Windows."""
     parts = [p for p in re.split(r"[\\/]+", text or "") if p.strip()]
     return "/".join(safe_name(p, "_") for p in parts)
+
+
+# --------------------------------------------------------------------------- #
+# Problem reports (Help > Report a problem)
+# --------------------------------------------------------------------------- #
+CRASH_FILE = DATA_DIR / "crash.log"
+_crash_handle = None
+
+
+def enable_crash_log():
+    """If the program ever crashes outright, Python writes where it was to data/crash.log."""
+    global _crash_handle
+    try:
+        import faulthandler
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _crash_handle = open(CRASH_FILE, "a", encoding="utf-8")
+        _crash_handle.write(f"\n--- started {datetime.now():%Y-%m-%d %H:%M:%S} ---\n")
+        _crash_handle.flush()
+        faulthandler.enable(_crash_handle, all_threads=True)
+    except Exception:
+        pass
+
+
+def thread_dump() -> str:
+    """Where every part of the program is right now (shows exactly where something is stuck)."""
+    import tempfile
+    import faulthandler
+    try:
+        with tempfile.TemporaryFile("w+", encoding="utf-8") as f:
+            faulthandler.dump_traceback(f, all_threads=True)
+            f.seek(0)
+            return f.read()
+    except Exception as e:
+        return f"(couldn't get the thread dump: {e})"
+
+
+def _hide_user(text: str) -> str:
+    home = str(Path.home())
+    user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+    text = text.replace(home, "<home>")
+    if user and len(user) > 2:
+        text = re.sub(re.escape(user), "<user>", text, flags=re.I)
+    return text
+
+
+def _tail(p: Path, max_chars: int) -> str:
+    try:
+        t = p.read_text("utf-8", errors="replace")
+        return t[-max_chars:] if len(t) > max_chars else t
+    except OSError:
+        return "(none)"
+
+
+def make_report(state: dict) -> str:
+    import platform
+    lines = [f"{APP_NAME} problem report — {datetime.now():%Y-%m-%d %H:%M:%S}"]
+    try:
+        ver = (APP_DIR / "VERSION").read_text("utf-8").strip()
+    except OSError:
+        ver = "?"
+    lines.append(f"Version: {ver}")
+    lines.append(f"System: {platform.platform()} · Python {platform.python_version()}")
+    for mod in ("PySide6", "exifread", "mutagen"):
+        try:
+            m = __import__(mod)
+            lines.append(f"{mod}: {getattr(m, '__version__', '?')}")
+        except Exception:
+            lines.append(f"{mod}: not installed")
+    lib = state.get("library")
+    if lib:
+        lines.append(f"Library drive: {fs_type(Path(lib)) or '?'} · {human_size(max(0, free_bytes(Path(lib))))} free")
+    lines.append("")
+    lines.append("== What it was doing ==")
+    for k, v in state.items():
+        lines.append(f"{k}: {v}")
+    lines.append("")
+    lines.append("== Settings ==")
+    s = load_settings()
+    for k in sorted(s):
+        if k in ("geometry", "columns", "tree_columns"):
+            continue
+        lines.append(f"{k}: {s[k]}")
+    lines.append("")
+    lines.append("== Where each part of the program is right now ==")
+    lines.append(thread_dump())
+    lines.append("== Recent errors ==")
+    lines.append(_tail(LOG_FILE, 20000))
+    lines.append("== Crash log ==")
+    lines.append(_tail(CRASH_FILE, 6000))
+    return _hide_user("\n".join(lines))

@@ -14,13 +14,13 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QByteArray, QModelIndex, QThread, QTimer, QUrl, Qt, Signal
+from PySide6.QtCore import QAbstractTableModel, QByteArray, QLockFile, QModelIndex, QThread, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QIcon, QPalette
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
                                QMainWindow, QMessageBox, QProgressBar, QPushButton, QSystemTrayIcon,
                                QSpinBox, QTableView, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
-                               QWidget, QMenu)
+                               QWidget, QMenu, QDialog, QDialogButtonBox, QPlainTextEdit)
 from PySide6.QtGui import QKeySequence, QShortcut
 
 import engine
@@ -131,6 +131,7 @@ class ScanWorker(QThread):
         if batch:
             engine.plan(batch, self.settings, albums, self.aliases)
             self.found.emit(batch)
+        store.close()
         self.sources.emit(summaries)
 
 
@@ -138,6 +139,9 @@ class CopyWorker(QThread):
     progress = Signal(int, int, object)      # done, total, bytes done
     status = Signal(str)
     row_done = Signal(int)
+    file_progress = Signal(str)              # inside a big file: "MVI_0042.MOV · 3.1 of 12.4 GB"
+
+    RETRIES = 2                              # a flaky card reader often works on the second try
 
     def __init__(self, items, rows, dest, more_coming):
         super().__init__()
@@ -149,6 +153,14 @@ class CopyWorker(QThread):
         self.error = ""
         self.log_path = None
         self.cancelled = False
+        self.activity = "Starting"
+        self.last_activity = time.monotonic()
+        self.gone_drives: set[str] = set()
+        self.leftovers = 0
+
+    def _touch(self, what: str):
+        self.activity = what
+        self.last_activity = time.monotonic()
 
     def run(self):
         started = datetime.now()
@@ -158,13 +170,22 @@ class CopyWorker(QThread):
             # also where Pause takes effect, even in the middle of a big file
             while self.paused and not self.stop:
                 time.sleep(0.2)
+                self.last_activity = time.monotonic()
             return self.stop
 
-        done_items = []
+        log = store = index = None
+        last_emit = [0.0]
         try:
+            self._touch("Checking what's already in the library")
             self.status.emit("Checking what's already on the destination drive…")
             index = engine.DestIndex(self.dest)
-            index.build(lambda n: self.status.emit(f"Checking what's already on the drive… {n:,} files"), cancel)
+            index.build(lambda n: (self._touch(f"Checking the library ({n:,} files)"),
+                                   self.status.emit(f"Checking what's already on the drive… {n:,} files")), cancel)
+            self.leftovers = index.leftovers
+            guard = engine.Guard(self.dest)
+            log = engine.LogWriter(self.dest, started)
+            self.log_path = log.path
+            store = engine.CardStore(self.dest)
             done, done_bytes = 0, 0
             while True:
                 if cancel():
@@ -172,6 +193,7 @@ class CopyWorker(QThread):
                     break
                 if not self.queue:
                     if self.more_coming():
+                        self._touch("Waiting for dropped files to be read")
                         self.status.emit("Waiting for the files you dropped to be read…")
                         time.sleep(0.2)
                         continue
@@ -180,24 +202,70 @@ class CopyWorker(QThread):
                 it = self.items[r]
                 if it.status != "Waiting":
                     continue
+                drive = str(engine.volume_root(it.src))
+                if drive in self.gone_drives:
+                    it.note = "Its card or drive was unplugged. Plug it back in and press Start copying."
+                    self.row_done.emit(r)
+                    continue
+                self._touch(f"Copying {it.src}")
                 self.status.emit(f"Copying {it.src.name}  →  {it.folder.replace('/', ' › ')}")
-                try:
-                    engine.process(it, index, cancel)
-                except engine.Cancelled:
-                    it.status, it.note, it.dest = "Waiting", "", ""
-                    self.cancelled = True
-                    break
-                except Exception as e:
-                    engine.log_error(f"Copying {it.src}", e)
-                    it.status, it.note = "Error", str(e)
-                done_items.append(it)
-                done += 1
-                done_bytes += it.size
+
+                def on_bytes(what, d, t, name=it.src.name):
+                    self.last_activity = time.monotonic()
+                    now = time.monotonic()
+                    if now - last_emit[0] > 0.3 or d >= t:
+                        last_emit[0] = now
+                        self.file_progress.emit(f"{what} {name} · {engine.human_size(d)} of {engine.human_size(t)}")
+
+                stop_run = False
+                for attempt in range(self.RETRIES + 1):
+                    try:
+                        engine.process(it, index, cancel, guard, on_bytes)
+                        break
+                    except engine.Cancelled:
+                        it.status, it.note, it.dest = "Waiting", "", ""
+                        self.cancelled = stop_run = True
+                        break
+                    except (engine.DriveFull, engine.DriveGone) as e:
+                        it.status, it.dest = "Waiting", ""
+                        it.note = str(e)
+                        self.error = str(e)
+                        stop_run = True
+                        break
+                    except Exception as e:
+                        if engine.is_disk_full(e):
+                            it.status, it.dest, it.note = "Waiting", "", "The library drive is full."
+                            self.error = "The library drive is full."
+                            stop_run = True
+                            break
+                        if not engine.exists(self.dest):
+                            it.status, it.dest, it.note = "Waiting", "", "The library drive was disconnected."
+                            self.error = "The library drive was disconnected. Plug it back in and press Start copying."
+                            stop_run = True
+                            break
+                        if engine.source_gone(it):
+                            self.gone_drives.add(drive)
+                            it.status, it.dest = "Waiting", ""
+                            it.note = "Its card or drive was unplugged. Plug it back in and press Start copying."
+                            break
+                        if attempt < self.RETRIES and not isinstance(e, (FileNotFoundError, PermissionError)):
+                            engine.log_error(f"Copying {it.src} (attempt {attempt + 1}, trying again)", e)
+                            self.status.emit(f"Couldn't read {it.src.name}, trying again…")
+                            time.sleep(2)
+                            continue
+                        engine.log_error(f"Copying {it.src}", e)
+                        it.status, it.note = "Error", str(e)
+                if it.status != "Waiting":
+                    log.write(it)
+                    store.record(it, engine.source_key(it.src)[1] if it.source_id else "")
+                    done += 1
+                    done_bytes += it.size
+                    self.progress.emit(done, done + len(self.queue), done_bytes)
                 self.row_done.emit(r)
-                self.progress.emit(done, done + len(self.queue), done_bytes)
-                if done % 200 == 0:
-                    index.save()
-            index.save()
+                if stop_run:
+                    break
+                if done and done % 200 == 0:
+                    index.save(drop_missing=False)
         except engine.Cancelled:
             self.cancelled = True
         except Exception as e:
@@ -205,15 +273,19 @@ class CopyWorker(QThread):
             self.error = str(e)
         finally:
             engine.keep_awake(False)
-            if done_items:
-                self.log_path = engine.write_log(self.dest, done_items, started)
-                try:
-                    store = engine.CardStore(self.dest)
-                    for it in done_items:
-                        store.record(it, engine.source_key(it.src)[1] if it.source_id else "")
-                    store.save()
-                except Exception as e:
-                    engine.log_error("Remembering cards", e)
+            self._touch("Saving the library records")
+            for closer in ((lambda: index.save(drop_missing=False)) if index else None,
+                           index.close if index else None,
+                           store.close if store else None,
+                           log.close if log else None):
+                if closer:
+                    try:
+                        closer()
+                    except Exception as e:
+                        engine.log_error("Finishing up", e)
+            if engine.exists(self.dest):
+                engine.backup_db(self.dest)
+            self._touch("Finished")
 
 
 class HealthWorker(QThread):
@@ -463,6 +535,8 @@ class MainWindow(QMainWindow):
         self.healer: HealthWorker | None = None
         self.tray: QSystemTrayIcon | None = None
         self.aliases: dict = engine.load_aliases(self.dest())
+        self.lock: QLockFile | None = None
+        self._stall_logged = 0.0
         self.source_lines: list[str] = []
         self._paused_at = 0.0
         self._upd_check = None
@@ -641,6 +715,10 @@ class MainWindow(QMainWindow):
         self._update_buttons()
         self._rebuild_tree()
         self._restore_layout()
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(30000)
+        self._watchdog.timeout.connect(self._check_stall)
+        self._watchdog.start()
         if self.settings.get("check_updates", True):
             QTimer.singleShot(2500, lambda: self.check_updates(quiet=True))
 
@@ -691,6 +769,9 @@ class MainWindow(QMainWindow):
         m = self.menuBar().addMenu("&Help")
         a = QAction("How it works", self)
         a.triggered.connect(self._how)
+        m.addAction(a)
+        a = QAction("Report a problem…", self)
+        a.triggered.connect(self.report_problem)
         m.addAction(a)
         a = QAction("Open the error log", self)
         a.triggered.connect(lambda: open_path(engine.LOG_FILE) if engine.LOG_FILE.exists()
@@ -895,7 +976,8 @@ class MainWindow(QMainWindow):
 
     def _update_summary(self):
         if not self._tree_timer.isActive():     # at most a few rebuilds a second while copying
-            self._tree_timer.start(1500 if self.copier else 400)
+            big = len(self.model.items) > 50000
+            self._tree_timer.start((10000 if big else 1500) if self.copier else (1500 if big else 400))
         items = self.model.items
         if not items:
             self.summary.setText("")
@@ -953,6 +1035,10 @@ class MainWindow(QMainWindow):
         if not rows and not self.scanners:
             self.status.setText("Nothing waiting to copy.")
             return
+        if not self._preflight(dest, rows):
+            return
+        if not self._take_lock(dest):
+            return
         need = sum(self.model.items[r].size for r in rows)
         try:
             free = shutil.disk_usage(dest).free
@@ -972,6 +1058,7 @@ class MainWindow(QMainWindow):
         self.model.refresh_all()
         c = self.copier = CopyWorker(self.model.items, rows, dest, lambda: bool(self.scanners))
         c.status.connect(self.status.setText)
+        c.file_progress.connect(self.status.setText)
         c.row_done.connect(self._row_done)
         c.progress.connect(self._progress)
         c.finished.connect(self._copy_done)
@@ -1028,6 +1115,7 @@ class MainWindow(QMainWindow):
     def _copy_done(self):
         c = self.copier
         self.copier = None
+        self._release_lock()
         self.b_pause.setText("Pause")
         self.bar.hide()
         self._update_buttons()
@@ -1048,7 +1136,13 @@ class MainWindow(QMainWindow):
             msg += f"\n{errors:,} couldn't be copied (see the Note column; press Start copying to retry them)"
         if c.error:
             msg += f"\n\n{c.error}"
-        if c.cancelled:
+        if c.gone_drives:
+            msg += ("\n\nA card or drive was unplugged during copying (" + ", ".join(sorted(c.gone_drives))
+                    + "). Its remaining files are still waiting: plug it back in and press Start copying.")
+        if c.leftovers:
+            msg += (f"\n\n{c.leftovers:,} half-finished copies from an earlier crash or power cut were "
+                    "cleaned up (only the program's own temporary files).")
+        if c.cancelled or (c.error and any(it.status == "Waiting" for it in self.model.items)):
             msg += "\n\nPress Start copying to carry on where it stopped."
         self.status.setText(msg.replace("\n\n", "  ").replace("\n", " · "))
         self.notify(head.rstrip("."), f"{copied + renamed:,} copied, {dupes:,} already in the library"
@@ -1064,6 +1158,128 @@ class MainWindow(QMainWindow):
             open_path(self.dest())
         elif b_log is not None and clicked is b_log:
             open_path(c.log_path)
+
+    # ------------------------------------------------------------ reliability
+    def _take_lock(self, lib: Path) -> bool:
+        """Only one Millésime window works on a library at a time, so its records can't get mixed up."""
+        try:
+            os.makedirs(engine.L(lib / engine.META_NAME), exist_ok=True)
+            lock = QLockFile(str(lib / engine.META_NAME / "millesime.lock"))
+            lock.setStaleLockTime(0)          # a crashed window's lock is cleared automatically
+            if not lock.tryLock(500):
+                QMessageBox.warning(self, APP_NAME, "Another Millésime window (on this or another computer) is "
+                                    "working on this library right now. Wait for it to finish, then try again.")
+                return False
+            self.lock = lock
+            return True
+        except Exception as e:
+            engine.log_error("Locking the library", e)
+            return True
+
+    def _release_lock(self):
+        if self.lock:
+            try:
+                self.lock.unlock()
+            except Exception:
+                pass
+            self.lock = None
+
+    def _preflight(self, dest: Path, rows) -> bool:
+        """Warnings before a copy starts. Returns False if the user chose not to go ahead."""
+        items = [self.model.items[r] for r in rows]
+        warnings = []
+        if os.name == "nt":
+            sysdrive = (os.environ.get("SystemDrive", "C:") + "\\").upper()
+            if str(engine.volume_root(dest)).upper() == sysdrive and self.settings.get("ok_sysdrive") != str(dest):
+                warnings.append(("The library is on the drive Windows runs from. That isn't much of a backup: if "
+                                 "this drive fails, the library goes with it. Choose a folder on the new drive "
+                                 "instead (Choose… at the top).", "ok_sysdrive"))
+        fs = engine.fs_type(dest).upper()
+        if fs.startswith("FAT"):
+            big = sum(1 for it in items if it.size >= engine.FAT_LIMIT)
+            if big:
+                warnings.append((f"The library drive is formatted {fs}, which can't hold files of 4 GB or more. "
+                                 f"{big:,} file(s) here are that big (usually long videos) and will show as errors. "
+                                 "Reformatting the drive as NTFS (or exFAT) avoids this; it erases the drive, so do "
+                                 "it before copying.", ""))
+        same = sum(1 for it in items if str(engine.volume_root(it.src)).upper() == str(engine.volume_root(dest)).upper())
+        if same:
+            warnings.append((f"{same:,} of these files are already on the library drive (just in another folder). "
+                             "Copying them uses that space twice.", ""))
+        for text, key in warnings:
+            if QMessageBox.question(self, "Before copying", text + "\n\nCopy anyway?") != QMessageBox.Yes:
+                return False
+            if key:
+                self.settings[key] = str(dest)
+                engine.save_settings(self.settings)
+        return True
+
+    def _check_stall(self):
+        """If nothing has moved for 5 minutes, write down where it's stuck (for Report a problem)."""
+        c = self.copier
+        if not c or c.paused:
+            return
+        idle = time.monotonic() - c.last_activity
+        if idle > 300 and time.monotonic() - self._stall_logged > 600:
+            self._stall_logged = time.monotonic()
+            engine.log_error(f"No progress for {int(idle // 60)} minutes while: {c.activity}",
+                             "Where each part of the program is:\n" + engine.thread_dump())
+            self.status.setText(f"No progress for {int(idle // 60)} minutes on: {c.activity}. The card may have a "
+                                "bad spot. You can press Stop, and Help › Report a problem… makes a report to send.")
+
+    def report_problem(self):
+        c, h = self.copier, self.healer
+        state = {"library": str(self.dest() or ""), "files in list": len(self.model.items),
+                 "copying": bool(c), "scanning": len(self.scanners), "health check": bool(h),
+                 "status line": self.status.text()}
+        if c:
+            state.update({"current step": c.activity, "paused": c.paused,
+                          "seconds since last progress": int(time.monotonic() - c.last_activity),
+                          "queued": len(c.queue)})
+        counts: dict = {}
+        for it in self.model.items:
+            counts[it.status] = counts.get(it.status, 0) + 1
+        state["results so far"] = counts
+        errs = [f"{it.src.name}: {it.note}" for it in self.model.items if it.status == "Error"][:30]
+        if errs:
+            state["file errors"] = "\n  " + "\n  ".join(errs)
+        text = engine.make_report(state)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Report a problem")
+        dlg.resize(820, 600)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("This report shows what the app was doing, its settings and recent errors (your "
+                             "Windows user name is hidden). Copy it, or save it as a file, and send it along with "
+                             "a sentence about what happened."))
+        box = QPlainTextEdit(text)
+        box.setReadOnly(True)
+        lay.addWidget(box, 1)
+        btns = QDialogButtonBox()
+        b_copy = btns.addButton("Copy to clipboard", QDialogButtonBox.ActionRole)
+        b_save = btns.addButton("Save to desktop", QDialogButtonBox.ActionRole)
+        btns.addButton(QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+
+        def copy():
+            QApplication.clipboard().setText(text)
+            b_copy.setText("Copied ✓")
+
+        def save():
+            desk = Path.home() / "Desktop"
+            if not desk.is_dir():
+                desk = Path.home()
+            p = desk / f"Millesime problem report {datetime.now():%Y-%m-%d %H%M}.txt"
+            try:
+                p.write_text(text, "utf-8")
+                b_save.setText("Saved ✓")
+                QMessageBox.information(dlg, "Saved", f"Saved as:\n{p}")
+            except OSError as e:
+                QMessageBox.warning(dlg, "Save", f"Couldn't save it: {e}")
+
+        b_copy.clicked.connect(copy)
+        b_save.clicked.connect(save)
+        dlg.exec()
 
     # ---------------------------------------------------- drop anywhere
     def dragEnterEvent(self, e):
@@ -1365,6 +1581,8 @@ class MainWindow(QMainWindow):
                 "(never your cards), changes nothing, and can take a while on a big library. You can stop "
                 "it any time. Start?") != QMessageBox.Yes:
             return
+        if not self._take_lock(lib):
+            return
         w = self.healer = HealthWorker(lib)
         w.progress.connect(self._health_progress)
         w.finished.connect(self._health_done)
@@ -1386,6 +1604,7 @@ class MainWindow(QMainWindow):
     def _health_done(self):
         w = self.healer
         self.healer = None
+        self._release_lock()
         self.bar.hide()
         self._update_buttons()
         if w.cancelled:
@@ -1452,6 +1671,7 @@ class MainWindow(QMainWindow):
             self.healer.stop = True
             self.healer.wait(5000)
         self._save_layout()
+        self._release_lock()
         if self.tray:
             self.tray.hide()
         engine.save_settings(self.settings)
@@ -1561,6 +1781,15 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("kefirman9000.millesime")
         except Exception:
             pass
+    engine.enable_crash_log()
+
+    def unexpected(kind, value, tb):
+        engine.log_error("Unexpected problem", value.with_traceback(tb) if tb else value)
+
+    sys.excepthook = unexpected                  # nothing fails silently: it all goes in the error log
+    import threading
+    threading.excepthook = lambda a: engine.log_error(f"Unexpected problem in {a.thread.name if a.thread else 'a thread'}",
+                                                     a.exc_value)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
