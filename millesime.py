@@ -14,12 +14,12 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QThread, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices
+from PySide6.QtCore import QAbstractTableModel, QByteArray, QModelIndex, QThread, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QIcon, QPalette
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-                               QMainWindow, QMessageBox, QProgressBar, QPushButton, QTableView,
-                               QVBoxLayout, QWidget)
+                               QMainWindow, QMessageBox, QProgressBar, QPushButton, QSystemTrayIcon,
+                               QTableView, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 import engine
 import updater
@@ -28,8 +28,48 @@ APP_NAME = engine.APP_NAME
 SPONSOR_URL = "https://github.com/sponsors/kefirman9000"
 
 
+ICON_FILE = engine.APP_DIR / "icon.png"
+
+
 def open_path(p: Path):
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+
+
+# --------------------------------------------------------------------------- #
+# Light / dark
+# --------------------------------------------------------------------------- #
+def _system_is_dark(app) -> bool:
+    try:
+        return app.styleHints().colorScheme() == Qt.ColorScheme.Dark
+    except Exception:
+        return False
+
+
+def apply_theme(app, mode: str):
+    """mode: 'system' (follow Windows), 'light' or 'dark'."""
+    dark = _system_is_dark(app) if mode == "system" else mode == "dark"
+    if not dark:
+        app.setPalette(app.style().standardPalette())
+        return
+    p = QPalette()
+    base, window, text = QColor(32, 33, 36), QColor(43, 44, 48), QColor(232, 232, 232)
+    p.setColor(QPalette.Window, window)
+    p.setColor(QPalette.WindowText, text)
+    p.setColor(QPalette.Base, base)
+    p.setColor(QPalette.AlternateBase, QColor(40, 41, 45))
+    p.setColor(QPalette.ToolTipBase, window)
+    p.setColor(QPalette.ToolTipText, text)
+    p.setColor(QPalette.Text, text)
+    p.setColor(QPalette.Button, QColor(52, 53, 58))
+    p.setColor(QPalette.ButtonText, text)
+    p.setColor(QPalette.BrightText, QColor(255, 90, 90))
+    p.setColor(QPalette.Link, QColor(110, 170, 255))
+    p.setColor(QPalette.Highlight, QColor(43, 123, 214))
+    p.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+    p.setColor(QPalette.PlaceholderText, QColor(140, 140, 140))
+    for role in (QPalette.Text, QPalette.ButtonText, QPalette.WindowText):
+        p.setColor(QPalette.Disabled, role, QColor(120, 120, 120))
+    app.setPalette(p)
 
 
 # --------------------------------------------------------------------------- #
@@ -91,6 +131,7 @@ class CopyWorker(QThread):
         self.queue: deque[int] = deque(rows)   # files dropped while copying are added here
         self.more_coming = more_coming
         self.stop = False
+        self.paused = False
         self.error = ""
         self.log_path = None
         self.cancelled = False
@@ -98,7 +139,13 @@ class CopyWorker(QThread):
     def run(self):
         started = datetime.now()
         engine.keep_awake(True)
-        cancel = lambda: self.stop
+
+        def cancel():
+            # also where Pause takes effect, even in the middle of a big file
+            while self.paused and not self.stop:
+                time.sleep(0.2)
+            return self.stop
+
         done_items = []
         try:
             self.status.emit("Checking what's already on the destination drive…")
@@ -106,7 +153,7 @@ class CopyWorker(QThread):
             index.build(lambda n: self.status.emit(f"Checking what's already on the drive… {n:,} files"), cancel)
             done, done_bytes = 0, 0
             while True:
-                if self.stop:
+                if cancel():
                     self.cancelled = True
                     break
                 if not self.queue:
@@ -348,10 +395,14 @@ class MainWindow(QMainWindow):
         self.scanners: list[ScanWorker] = []
         self.copier: CopyWorker | None = None
         self.healer: HealthWorker | None = None
+        self.tray: QSystemTrayIcon | None = None
+        self._paused_at = 0.0
         self._upd_check = None
         self._upd_apply = None
         self._copy_t0 = 0.0
         self.setWindowTitle(f"{APP_NAME} — sort cards and old drives onto a new drive")
+        if ICON_FILE.exists():
+            self.setWindowIcon(QIcon(str(ICON_FILE)))
         self.resize(1180, 800)
         self._menus()
 
@@ -450,6 +501,10 @@ class MainWindow(QMainWindow):
         self.b_start.setFont(f)
         self.b_start.clicked.connect(self.start)
         row.addWidget(self.b_start)
+        self.b_pause = QPushButton("Pause")
+        self.b_pause.clicked.connect(self.toggle_pause)
+        self.b_pause.hide()
+        row.addWidget(self.b_pause)
         self.b_cancel = QPushButton("Stop")
         self.b_cancel.clicked.connect(self.cancel)
         self.b_cancel.hide()
@@ -469,7 +524,22 @@ class MainWindow(QMainWindow):
         for col, wd in enumerate((200, 110, 200, 320, 120)):
             self.table.setColumnWidth(col, wd)
         self.table.doubleClicked.connect(self._open_row)
-        v.addWidget(self.table, 1)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Folder", "Files", "Size"])
+        self.tree.setColumnWidth(0, 420)
+        self.tree.setColumnWidth(1, 90)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.itemDoubleClicked.connect(self._open_tree_item)
+        self._tree_timer = QTimer(self)
+        self._tree_timer.setSingleShot(True)
+        self._tree_timer.setInterval(400)
+        self._tree_timer.timeout.connect(self._rebuild_tree)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.tree, "Where files will go")
+        self.tabs.addTab(self.table, "All files")
+        v.addWidget(self.tabs, 1)
 
         self.bar = QProgressBar()
         self.bar.hide()
@@ -481,6 +551,8 @@ class MainWindow(QMainWindow):
         self._show_dest()
         self._show_example()
         self._update_buttons()
+        self._rebuild_tree()
+        self._restore_layout()
         if self.settings.get("check_updates", True):
             QTimer.singleShot(2500, lambda: self.check_updates(quiet=True))
 
@@ -497,9 +569,28 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._open_logs)
         m.addAction(a)
         m.addSeparator()
+        a = QAction("Make a desktop shortcut", self)
+        a.triggered.connect(self.make_shortcut)
+        m.addAction(a)
+        m.addSeparator()
         a = QAction("Quit", self)
         a.triggered.connect(self.close)
         m.addAction(a)
+
+        m = self.menuBar().addMenu("&View")
+        grp = QActionGroup(self)
+        for key, label in (("system", "Match Windows"), ("light", "Light"), ("dark", "Dark")):
+            a = QAction(label, self, checkable=True)
+            a.setChecked(self.settings.get("theme", "system") == key)
+            a.triggered.connect(lambda _=False, k=key: self._set_theme(k))
+            grp.addAction(a)
+            m.addAction(a)
+        m.addSeparator()
+        self.a_notify = QAction("Notify me when copying finishes", self, checkable=True)
+        self.a_notify.setChecked(self.settings.get("notify", True))
+        self.a_notify.toggled.connect(lambda on: (self.settings.__setitem__("notify", on),
+                                                  engine.save_settings(self.settings)))
+        m.addAction(self.a_notify)
 
         m = self.menuBar().addMenu("&Tools")
         a = QAction("Check the library for damaged files…", self)
@@ -611,6 +702,7 @@ class MainWindow(QMainWindow):
             return
         engine.plan(self.model.items, self.settings, {})
         self.model.refresh_all()
+        self._tree_timer.start()
 
     def _show_example(self):
         s = self.settings
@@ -696,6 +788,8 @@ class MainWindow(QMainWindow):
             self.start()
 
     def _update_summary(self):
+        if not self._tree_timer.isActive():     # at most a few rebuilds a second while copying
+            self._tree_timer.start(1500 if self.copier else 400)
         items = self.model.items
         if not items:
             self.summary.setText("")
@@ -796,7 +890,24 @@ class MainWindow(QMainWindow):
             left = f" · about {int(remain // 60)} min {int(remain % 60)} s left"
         self.bar.setFormat(f"{done:,} of {total:,} · {engine.human_size(rate)}/s{left}")
 
+    def toggle_pause(self):
+        c = self.copier
+        if not c:
+            return
+        c.paused = not c.paused
+        if c.paused:
+            self._paused_at = time.monotonic()
+            self.b_pause.setText("Resume")
+            self.status.setText("Paused. Press Resume to carry on (or Stop).")
+            self.bar.setFormat("Paused · " + self.bar.format())
+        else:
+            self._copy_t0 += time.monotonic() - self._paused_at   # don't count the pause in the speed
+            self.b_pause.setText("Pause")
+            self.status.setText("Carrying on…")
+
     def cancel(self):
+        if self.copier:
+            self.copier.paused = False
         if self.healer:
             self.healer.stop = True
         if self.copier:
@@ -808,6 +919,7 @@ class MainWindow(QMainWindow):
     def _copy_done(self):
         c = self.copier
         self.copier = None
+        self.b_pause.setText("Pause")
         self.bar.hide()
         self._update_buttons()
         self._update_summary()
@@ -830,6 +942,8 @@ class MainWindow(QMainWindow):
         if c.cancelled:
             msg += "\n\nPress Start copying to carry on where it stopped."
         self.status.setText(msg.replace("\n\n", "  ").replace("\n", " · "))
+        self.notify(head.rstrip("."), f"{copied + renamed:,} copied, {dupes:,} already in the library"
+                    + (f", {errors:,} problems" if errors else ""), warn=bool(errors or c.error))
         box = QMessageBox(QMessageBox.Information if not (errors or c.error) else QMessageBox.Warning,
                           APP_NAME, msg, parent=self)
         b_open = box.addButton("Open library", QMessageBox.ActionRole)
@@ -841,6 +955,144 @@ class MainWindow(QMainWindow):
             open_path(self.dest())
         elif b_log is not None and clicked is b_log:
             open_path(c.log_path)
+
+    # ------------------------------------------------------- folder preview
+    def _rebuild_tree(self):
+        """A tree of the folders the waiting files will go into, with counts and sizes."""
+        expanded = set()
+
+        def walk(item, key=()):
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                k = key + (ch.text(0),)
+                if ch.isExpanded():
+                    expanded.add(k)
+                walk(ch, k)
+
+        had_tree = self.tree.topLevelItemCount() > 0 and self.tree.topLevelItem(0).childCount() > 0
+        walk(self.tree.invisibleRootItem())
+        self.tree.clear()
+        waiting = [it for it in self.model.items if it.status == "Waiting"]
+        if not waiting:
+            done = len(self.model.items)
+            msg = ("Nothing waiting. Drop cards or folders above to see where their files will go."
+                   if not done else f"All {done:,} files in the list are done. Drop more to add them.")
+            QTreeWidgetItem(self.tree, [msg, "", ""])
+            return
+        root = self.dest()
+        nodes: dict[tuple, list] = {}
+        for it in waiting:
+            parts = tuple(p for p in it.folder.split("/") if p)
+            for i in range(1, len(parts) + 1):
+                n = nodes.setdefault(parts[:i], [0, 0])
+                n[0] += 1
+                n[1] += it.size
+        top = QTreeWidgetItem(self.tree, [str(root or "Library"), f"{len(waiting):,}",
+                                          engine.human_size(sum(it.size for it in waiting))])
+        widgets = {(): top}
+        for key in sorted(nodes):
+            cnt, size = nodes[key]
+            w = QTreeWidgetItem(widgets[key[:-1]], [key[-1], f"{cnt:,}", engine.human_size(size)])
+            w.setData(0, Qt.UserRole, "/".join(key))
+            w.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+            w.setTextAlignment(2, Qt.AlignRight | Qt.AlignVCenter)
+            widgets[key] = w
+            if (str(root or "Library"),) + key in expanded or (not had_tree and len(key) < 2):
+                w.setExpanded(True)
+        top.setExpanded(True)
+
+    def _open_tree_item(self, item, _col):
+        rel = item.data(0, Qt.UserRole)
+        d = self.dest()
+        if d:
+            p = d / rel if rel else d
+            while p != d and not p.exists():
+                p = p.parent
+            if p.exists():
+                open_path(p)
+
+    # ------------------------------------------------------- looks and layout
+    def _set_theme(self, key):
+        self.settings["theme"] = key
+        engine.save_settings(self.settings)
+        apply_theme(QApplication.instance(), key)
+
+    def _restore_layout(self):
+        try:
+            g = self.settings.get("geometry")
+            if g:
+                self.restoreGeometry(QByteArray.fromHex(g.encode()))
+            h = self.settings.get("columns")
+            if h:
+                self.table.horizontalHeader().restoreState(QByteArray.fromHex(h.encode()))
+            t = self.settings.get("tree_columns")
+            if t:
+                self.tree.header().restoreState(QByteArray.fromHex(t.encode()))
+            self.tabs.setCurrentIndex(int(self.settings.get("tab", 0)))
+        except Exception as e:
+            engine.log_error("Restoring the window layout", e)
+
+    def _save_layout(self):
+        try:
+            self.settings["geometry"] = bytes(self.saveGeometry().toHex()).decode()
+            self.settings["columns"] = bytes(self.table.horizontalHeader().saveState().toHex()).decode()
+            self.settings["tree_columns"] = bytes(self.tree.header().saveState().toHex()).decode()
+            self.settings["tab"] = self.tabs.currentIndex()
+        except Exception as e:
+            engine.log_error("Saving the window layout", e)
+
+    def notify(self, title: str, text: str, warn: bool = False):
+        """Pop-up and sound when long work finishes, so you can walk away."""
+        if not self.settings.get("notify", True):
+            return
+        try:
+            if os.name == "nt":
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION if warn else winsound.MB_ICONASTERISK)
+            else:
+                QApplication.beep()
+        except Exception:
+            pass
+        QApplication.alert(self)      # flashes the taskbar button if the window is in the background
+        try:
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                if not self.tray:
+                    self.tray = QSystemTrayIcon(self.windowIcon(), self)
+                    self.tray.setToolTip(APP_NAME)
+                    self.tray.messageClicked.connect(lambda: (self.showNormal(), self.activateWindow()))
+                self.tray.show()
+                self.tray.showMessage(f"{APP_NAME}: {title}", text,
+                                      QSystemTrayIcon.Warning if warn else QSystemTrayIcon.Information, 8000)
+        except Exception as e:
+            engine.log_error("Showing a notification", e)
+
+    def make_shortcut(self):
+        if os.name != "nt":
+            QMessageBox.information(self, "Shortcut", "On a Mac, drag “Start Millesime (Mac).command” to the "
+                                    "Dock or desktop (hold Cmd+Option while dragging to make an alias).")
+            return
+        import subprocess
+        launcher = engine.APP_DIR / "Start Millesime (Windows).bat"
+        icon = engine.APP_DIR / "icon.ico"
+
+        def q(p):
+            return "'" + str(p).replace("'", "''") + "'"
+        ps = ("$d=[Environment]::GetFolderPath('Desktop');"
+              "$s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'Millesime.lnk'));"
+              f"$s.TargetPath={q(launcher)};$s.WorkingDirectory={q(engine.APP_DIR)};"
+              f"$s.IconLocation={q(icon)};$s.WindowStyle=7;"
+              "$s.Description='Sort cards and old drives onto a new drive';$s.Save()")
+        try:
+            r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                               capture_output=True, text=True, timeout=30,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if r.returncode == 0:
+                QMessageBox.information(self, "Shortcut", "A Millesime shortcut is now on your desktop.")
+            else:
+                raise RuntimeError((r.stderr or r.stdout or "").strip() or "PowerShell refused")
+        except Exception as e:
+            engine.log_error("Making a desktop shortcut", e)
+            QMessageBox.warning(self, "Shortcut", f"Couldn't make the shortcut:\n\n{e}")
 
     # ----------------------------------------------------------- health check
     def health_check(self):
@@ -905,6 +1157,8 @@ class MainWindow(QMainWindow):
             msg += f"\n{len(r['missing']):,} that were in the library before are gone (deleted or moved)."
         if not bad:
             msg += "\n\nNo damage found."
+        self.notify("Health check finished", "No damage found." if not bad else f"{bad:,} files need a look.",
+                    warn=bool(bad))
         self.status.setText(msg.replace("\n\n", "  ").replace("\n", " · "))
         box = QMessageBox(QMessageBox.Warning if bad else QMessageBox.Information, "Health check", msg, parent=self)
         b_rep = box.addButton("Open report", QMessageBox.ActionRole) if (bad or r["missing"]) and r["report"] else None
@@ -919,6 +1173,7 @@ class MainWindow(QMainWindow):
         waiting = any(it.status in ("Waiting", "Error") for it in self.model.items)
         self.b_start.setEnabled(not busy and not scanning and waiting)
         self.b_start.setVisible(not busy)
+        self.b_pause.setVisible(bool(self.copier))
         self.b_cancel.setVisible(busy or scanning)
         self.b_clear.setEnabled(not busy and not scanning)
         for wdg in (self.layout_box, self.raw_box, self.camvid_box, self.othervid_box, self.nodate_box,
@@ -933,6 +1188,7 @@ class MainWindow(QMainWindow):
                 return
             for s in self.scanners:
                 s.stop = True
+            self.copier.paused = False
             self.copier.stop = True
             self.copier.wait(15000)
         for s in self.scanners:
@@ -941,6 +1197,9 @@ class MainWindow(QMainWindow):
         if self.healer:
             self.healer.stop = True
             self.healer.wait(5000)
+        self._save_layout()
+        if self.tray:
+            self.tray.hide()
         engine.save_settings(self.settings)
         e.accept()
 
@@ -1051,6 +1310,16 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
+    if ICON_FILE.exists():
+        app.setWindowIcon(QIcon(str(ICON_FILE)))
+    settings = engine.load_settings()
+    apply_theme(app, settings.get("theme", "system"))
+    try:   # follow Windows when it switches between light and dark
+        app.styleHints().colorSchemeChanged.connect(
+            lambda _s: apply_theme(app, engine.load_settings().get("theme", "system"))
+            if engine.load_settings().get("theme", "system") == "system" else None)
+    except Exception:
+        pass
     w = MainWindow()
     w.show()
     sys.exit(app.exec())

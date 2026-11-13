@@ -42,6 +42,14 @@ D:\Library\
 The window shows an example of where each kind of file will go, so you can see the effect of
 each option before you copy anything.
 
+Before you copy, the **Where files will go** tab shows the folders your files will land in as a
+tree, with how many files and how much space each takes, e.g. `Photos › 2019 › 07 - July (212)`.
+The **All files** tab lists every file. Double-click a folder to open it.
+
+While copying you can **Pause** (it stops right away, even in the middle of a big video) and
+**Resume**, or **Stop**. When it finishes you get a Windows notification and a sound, so you can
+walk away during long copies (turn it off under **View**).
+
 ## How to sort
 
 | Option | Choices |
@@ -118,6 +126,13 @@ recording date of MP4/MOV videos. Rows that fell back to the file's own date are
 - The computer is kept awake while copying.
 - Format the new drive as NTFS (or exFAT if a Mac uses it too), not FAT32, which can't hold files
   over 4 GB.
+
+## Looks
+
+- **View › Match Windows / Light / Dark.** By default it follows Windows, including when Windows
+  switches on its own.
+- **File › Make a desktop shortcut** puts a Millésime icon on your desktop.
+- The window remembers its size, position, column widths and which tab you were on.
 
 ## Updates
 

@@ -116,6 +116,8 @@ DEFAULT_SETTINGS = {
     "no_date": "file_date",       # or "undated"
     "auto_start": False,
     "check_updates": True,
+    "theme": "system",            # system, light or dark
+    "notify": True,
 }
 
 
