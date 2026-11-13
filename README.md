@@ -170,6 +170,10 @@ recording date of MP4/MOV videos. Rows that fell back to the file's own date are
 - **Full drives.** It always leaves 2 GB free and stops cleanly before the drive fills.
 - **Flaky card readers.** A file that can't be read is tried again twice before it's marked as an
   error.
+- **Long random names.** Files named with long strings of random letters and numbers (download
+  IDs, hashes) are shortened to their first 16 characters, e.g. `a0d206116902beee.png`. Real names
+  are never changed, and any name too long for Windows is shortened to fit. The Note column and
+  the log say when this happens.
 - **Very long paths.** Files deep in long-named folders (common in Music) are handled past
   Windows' usual 260-character limit.
 - **Checks before copying.** It warns if the library is on the drive Windows runs from (not much of

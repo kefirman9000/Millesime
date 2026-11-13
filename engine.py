@@ -875,16 +875,37 @@ def _hide(p: Path):
 # --------------------------------------------------------------------------- #
 # Copying
 # --------------------------------------------------------------------------- #
+_RANDOMISH = re.compile(r"^[A-Za-z0-9_\-]+$")
+SHORT_RANDOM = 16
+
+
+def is_random_name(stem: str) -> bool:
+    """Long strings of random letters and numbers (download IDs, hashes, UUIDs), not real names."""
+    if len(stem) < 40 or not _RANDOMISH.match(stem):
+        return False
+    body = stem.replace("-", "").replace("_", "")
+    if re.fullmatch(r"[0-9a-fA-F]+", body):
+        return True                                     # hex: hashes, UUIDs
+    digits = sum(c.isdigit() for c in body)
+    longest_word = max((len(w) for w in re.findall(r"[A-Za-z]+", body)), default=0)
+    return digits >= len(body) * 0.2 and longest_word < 12   # mixed letters and numbers, no real words
+
+
+def tidy_stem(stem: str) -> str:
+    return stem[:SHORT_RANDOM] if is_random_name(stem) else stem
+
+
 def _free_name(index: DestIndex, folder: str, main_name: str, sidecars: list[Path]) -> str:
     """A file name for the main file (and matching names for its sidecars) that is not in use,
     shortened if needed so no name goes over Windows' 255-character limit."""
     stem, ext = os.path.splitext(main_name)
     extra = max([len(ext)] + [len(_sidecar_name(c, stem, ext, "")) for c in sidecars])
+    base = tidy_stem(stem)
     n = 0
     while True:
         tag = "" if n == 0 else f"_{n}"
         room = MAX_NAME - extra - len(tag)
-        new_stem = (stem if len(stem) <= room else stem[:max(1, room)].rstrip(" .")) + tag
+        new_stem = (base if len(base) <= room else base[:max(1, room)].rstrip(" .")) + tag
         names = [new_stem + ext] + [_sidecar_name(c, stem, ext, new_stem) for c in sidecars]
         if all(index.name_free(_join(folder, x)) for x in names):
             return new_stem + ext
@@ -1034,7 +1055,10 @@ def process(item: Item, index: DestIndex, cancel=lambda: False, guard: Guard | N
     item.dest = rel
     if name != item.src.name:
         item.status = "Copied (renamed)"
-        if not re.search(r"_\d+$", os.path.splitext(name)[0]):
+        old_stem = os.path.splitext(item.src.name)[0]
+        if is_random_name(old_stem) and not re.search(r"_\d+$", os.path.splitext(name)[0]):
+            item.note = f"Its long random name was shortened to {name}"
+        elif not re.search(r"_\d+$", os.path.splitext(name)[0]):
             item.note = f"Its name was too long for Windows, so it was shortened to {name}"
         else:
             item.note = f"A different file named {item.src.name} was already there, so this one is {name}"
