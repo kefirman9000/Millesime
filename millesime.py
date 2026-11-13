@@ -248,7 +248,8 @@ class CopyWorker(QThread):
                             it.status, it.dest = "Waiting", ""
                             it.note = "Its card or drive was unplugged. Plug it back in and press Start copying."
                             break
-                        if attempt < self.RETRIES and not isinstance(e, (FileNotFoundError, PermissionError)):
+                        if (attempt < self.RETRIES and not isinstance(e, (FileNotFoundError, PermissionError))
+                                and getattr(e, "errno", None) != 22):    # 22: Windows refused the name; retrying won't help
                             engine.log_error(f"Copying {it.src} (attempt {attempt + 1}, trying again)", e)
                             self.status.emit(f"Couldn't read {it.src.name}, trying again…")
                             time.sleep(2)

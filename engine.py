@@ -40,7 +40,14 @@ LOG_FILE = DATA_DIR / "errors.log"
 META_NAME = ".millesime"          # folder on the destination holding the index and sort logs
 INDEX_NAME = "index.json"
 LOGS_NAME = "logs"
-PART_SUFFIX = ".millesime-part"
+PART_SUFFIX = ".millesime-part"     # old temporary-copy names (still cleaned up)
+PART_PREFIX = ".millesime-"         # temporary copies are now ".millesime-1a2b3c4d.part"
+MAX_NAME = 255                      # Windows' limit for one file or folder name
+
+
+def is_temp_name(name: str) -> bool:
+    low = name.lower()
+    return low.endswith(PART_SUFFIX) or (low.startswith(PART_PREFIX) and low.endswith(".part"))
 
 RAW_EXT = {".3fr", ".ari", ".arw", ".bay", ".cr2", ".cr3", ".crw", ".dcr", ".dcs", ".dng", ".erf",
            ".fff", ".iiq", ".k25", ".kdc", ".mef", ".mos", ".mrw", ".nef", ".nrw", ".orf", ".pef",
@@ -266,7 +273,7 @@ def gather(paths: list[Path], settings: dict, dest_root: Path | None = None, can
                 if low in SKIP_FILES or n.startswith(("._", "~$")):
                     continue
                 stem, ext = os.path.splitext(low)
-                if ext in SIDECAR_EXT or ext in JUNK_EXT or low.endswith(PART_SUFFIX):
+                if ext in SIDECAR_EXT or ext in JUNK_EXT or is_temp_name(low):
                     continue
                 kind = kind_of(ext)
                 if kind == "photo" and has_music and (stem in ART_STEMS or stem.startswith("albumart")):
@@ -768,7 +775,7 @@ class DestIndex:
         cached = {r: (s, m, h) for r, s, m, h in self._con.execute("SELECT rel, size, mtime_ns, hash FROM files")}
         n = 0
         for rel, size, mtime in walk_files(self.root, cancel):
-            if rel.endswith(PART_SUFFIX):
+            if is_temp_name(rel.rpartition("/")[2]):
                 # a half-written copy from a crash or power cut: ours, never a real file
                 try:
                     os.unlink(L(self.root / rel))
@@ -869,11 +876,15 @@ def _hide(p: Path):
 # Copying
 # --------------------------------------------------------------------------- #
 def _free_name(index: DestIndex, folder: str, main_name: str, sidecars: list[Path]) -> str:
-    """A file name for the main file (and matching names for its sidecars) that is not in use."""
+    """A file name for the main file (and matching names for its sidecars) that is not in use,
+    shortened if needed so no name goes over Windows' 255-character limit."""
     stem, ext = os.path.splitext(main_name)
+    extra = max([len(ext)] + [len(_sidecar_name(c, stem, ext, "")) for c in sidecars])
     n = 0
     while True:
-        new_stem = stem if n == 0 else f"{stem}_{n}"
+        tag = "" if n == 0 else f"_{n}"
+        room = MAX_NAME - extra - len(tag)
+        new_stem = (stem if len(stem) <= room else stem[:max(1, room)].rstrip(" .")) + tag
         names = [new_stem + ext] + [_sidecar_name(c, stem, ext, new_stem) for c in sidecars]
         if all(index.name_free(_join(folder, x)) for x in names):
             return new_stem + ext
@@ -895,7 +906,9 @@ def safe_copy(src: Path, dest: Path, cancel=lambda: False, on_bytes=None) -> str
     """Copy src to dest without ever overwriting anything, and check the copy.
     Returns the checksum. Raises on any problem (and leaves nothing half-written behind)."""
     os.makedirs(L(dest.parent), exist_ok=True)
-    tmp = dest.with_name(dest.name + PART_SUFFIX)
+    # a short temporary name, so a long file name never goes over Windows' 255-character limit
+    import uuid
+    tmp = dest.with_name(f"{PART_PREFIX}{uuid.uuid4().hex[:12]}.part")
     h = hashlib.blake2b(digest_size=20)
     try:
         with open(L(src), "rb") as fi, open(L(tmp), "xb") as fo:
@@ -1021,7 +1034,10 @@ def process(item: Item, index: DestIndex, cancel=lambda: False, guard: Guard | N
     item.dest = rel
     if name != item.src.name:
         item.status = "Copied (renamed)"
-        item.note = f"A different file named {item.src.name} was already there, so this one is {name}"
+        if not re.search(r"_\d+$", os.path.splitext(name)[0]):
+            item.note = f"Its name was too long for Windows, so it was shortened to {name}"
+        else:
+            item.note = f"A different file named {item.src.name} was already there, so this one is {name}"
     else:
         item.status = "Copied"
     stem, ext = os.path.splitext(item.src.name)
