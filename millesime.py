@@ -142,9 +142,13 @@ class CopyWorker(QThread):
     file_progress = Signal(str)              # inside a big file: "MVI_0042.MOV · 3.1 of 12.4 GB"
 
     RETRIES = 2                              # a flaky card reader often works on the second try
+    BREAK_EVERY = 10 * 60                    # gentle mode: a short break every 10 minutes …
+    BREAK_FOR = 30                           # … of 30 seconds
 
-    def __init__(self, items, rows, dest, more_coming):
+    def __init__(self, items, rows, dest, more_coming, gentle=True):
         super().__init__()
+        self.gentle = gentle
+        self._worked_since = time.monotonic()
         self.items, self.dest = items, dest
         self.queue: deque[int] = deque(rows)   # files dropped while copying are added here
         self.more_coming = more_coming
@@ -158,6 +162,21 @@ class CopyWorker(QThread):
         self.gone_drives: set[str] = set()
         self.leftovers = 0
 
+    def _take_break(self):
+        before = self.activity
+        end = time.monotonic() + self.BREAK_FOR
+        while not self.stop and self.gentle and time.monotonic() < end:
+            left = int(end - time.monotonic()) + 1
+            self.status.emit(f"Gentle mode: a short break so the drives can catch up ({left} s)…")
+            self.activity = "Gentle-mode break"
+            self.last_activity = time.monotonic()
+            time.sleep(1)
+            while self.paused and not self.stop:
+                time.sleep(0.2)
+                end += 0.2
+        self.activity = before
+        self._worked_since = time.monotonic()
+
     def _touch(self, what: str):
         self.activity = what
         self.last_activity = time.monotonic()
@@ -167,12 +186,17 @@ class CopyWorker(QThread):
         engine.keep_awake(True)
 
         def cancel():
-            # also where Pause takes effect, even in the middle of a big file
+            # also where Pause and gentle-mode breaks take effect, even in the middle of a big file
             while self.paused and not self.stop:
                 time.sleep(0.2)
                 self.last_activity = time.monotonic()
+                self._worked_since = time.monotonic()
+            if self.gentle and not self.stop and time.monotonic() - self._worked_since > self.BREAK_EVERY:
+                self._take_break()
             return self.stop
 
+        if self.gentle:
+            engine.low_priority(True)
         log = store = index = None
         last_emit = [0.0]
         try:
@@ -274,6 +298,7 @@ class CopyWorker(QThread):
             self.error = str(e)
         finally:
             engine.keep_awake(False)
+            engine.low_priority(False)
             self._touch("Saving the library records")
             for closer in ((lambda: index.save(drop_missing=False)) if index else None,
                            index.close if index else None,
@@ -298,6 +323,8 @@ class HealthWorker(QThread):
 
     def run(self):
         engine.keep_awake(True)
+        if engine.load_settings().get("gentle", True):
+            engine.low_priority(True)
         try:
             self.result = engine.health_check(self.lib, self.progress.emit, lambda: self.stop)
         except engine.Cancelled:
@@ -307,6 +334,7 @@ class HealthWorker(QThread):
             self.error = str(e)
         finally:
             engine.keep_awake(False)
+            engine.low_priority(False)
 
 
 class UpdateCheckWorker(QThread):
@@ -753,6 +781,10 @@ class MainWindow(QMainWindow):
             grp.addAction(a)
             m.addAction(a)
         m.addSeparator()
+        self.a_gentle = QAction("Gentle mode (low priority, a 30-second break every 10 minutes)", self, checkable=True)
+        self.a_gentle.setChecked(self.settings.get("gentle", True))
+        self.a_gentle.toggled.connect(self._set_gentle)
+        m.addAction(self.a_gentle)
         self.a_notify = QAction("Notify me when copying finishes", self, checkable=True)
         self.a_notify.setChecked(self.settings.get("notify", True))
         self.a_notify.toggled.connect(lambda on: (self.settings.__setitem__("notify", on),
@@ -1057,7 +1089,8 @@ class MainWindow(QMainWindow):
             it.note = "Backed up before" if it.known_dest else ""
         engine.plan([self.model.items[r] for r in rows], self.settings, {}, self.aliases)
         self.model.refresh_all()
-        c = self.copier = CopyWorker(self.model.items, rows, dest, lambda: bool(self.scanners))
+        c = self.copier = CopyWorker(self.model.items, rows, dest, lambda: bool(self.scanners),
+                                     gentle=self.settings.get("gentle", True))
         c.status.connect(self.status.setText)
         c.file_progress.connect(self.status.setText)
         c.row_done.connect(self._row_done)
@@ -1487,6 +1520,13 @@ class MainWindow(QMainWindow):
                 open_path(p)
 
     # ------------------------------------------------------- looks and layout
+    def _set_gentle(self, on: bool):
+        self.settings["gentle"] = on
+        engine.save_settings(self.settings)
+        if self.copier:
+            self.copier.gentle = on      # breaks start or stop right away (priority changes next run)
+            self.status.setText("Gentle mode on." if on else "Gentle mode off: full speed.")
+
     def _set_theme(self, key):
         self.settings["theme"] = key
         engine.save_settings(self.settings)

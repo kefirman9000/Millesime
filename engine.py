@@ -129,6 +129,7 @@ DEFAULT_SETTINGS = {
     "auto_start": False,
     "check_updates": True,
     "min_photo_kb": 30,           # skip pictures smaller than this (icons, thumbnails); 0 = keep all
+    "gentle": True,               # low priority + short breaks while copying
     "theme": "system",            # system, light or dark
     "notify": True,
 }
@@ -1205,6 +1206,20 @@ def human_size(n: float) -> str:
             return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+def low_priority(on: bool):
+    """Gentle mode: this thread's disk and CPU use go to the back of the queue (Windows), so File
+    Explorer and other programs stay responsive. Call from the worker thread itself."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        # THREAD_MODE_BACKGROUND_BEGIN / END: low I/O and memory priority for the calling thread
+        k.SetThreadPriority(k.GetCurrentThread(), 0x00010000 if on else 0x00020000)
+    except Exception:
+        pass
 
 
 def keep_awake(on: bool):

@@ -164,6 +164,9 @@ recording date of MP4/MOV videos. Rows that fell back to the file's own date are
 - **Progress inside big files.** The status line shows how far through a big file it is
   (`Copying MVI_0042.MOV · 3.1 GB of 12.4 GB`, then `Checking the copy of …`), so a long video never
   looks stuck.
+- **Gentle mode** (on by default, **View** menu): copying runs at low priority so File Explorer and
+  other programs stay responsive, and it takes a 30-second break every 10 minutes so the drives can
+  catch up. Turn it off for full speed; the change takes effect straight away.
 - **Unplugged drives.** If the library drive is unplugged, copying stops cleanly and says so. If a
   card is pulled out, its remaining files wait while the others carry on. Plug it back in and
   press **Start copying** to finish.
