@@ -38,7 +38,6 @@ D:\Library\
 4. Check the list, then press **Start copying**. Or tick **Start copying as soon as I drop files**
    to have it start straight away.
 5. **Keep dropping** cards and folders while it copies. They join the queue and are copied next.
-6. When a card's files are done, press **Eject card** to remove it safely, then put in the next.
 
 The window shows an example of where each kind of file will go, so you can see the effect of
 each option before you copy anything.
@@ -77,7 +76,6 @@ together under `Unknown Artist` and the name of the folder they came from. `cove
   shown as an error; press **Start copying** again to retry those.
 - **Stopping is safe.** Press **Stop** (or close the window) any time; nothing is left
   half-copied. Drop the same cards again later and it carries on, skipping what's already there.
-- **Eject only offers finished cards**, never the library drive or the drive Windows runs from.
 
 ## Dates
 

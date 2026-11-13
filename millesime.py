@@ -18,8 +18,8 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, QThread, QTimer, QU
 from PySide6.QtGui import QAction, QColor, QDesktopServices
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-                               QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QTableView,
-                               QToolButton, QVBoxLayout, QWidget)
+                               QMainWindow, QMessageBox, QProgressBar, QPushButton, QTableView,
+                               QVBoxLayout, QWidget)
 
 import engine
 import updater
@@ -42,7 +42,6 @@ class ScanWorker(QThread):
     def __init__(self, paths, settings, dest):
         super().__init__()
         self.paths, self.settings, self.dest = paths, dict(settings), dest
-        self.drives = {engine.drive_of(p) for p in paths} - {""}
         self.stop = False
 
     def run(self):
@@ -134,15 +133,6 @@ class CopyWorker(QThread):
             engine.keep_awake(False)
             if done_items:
                 self.log_path = engine.write_log(self.dest, done_items, started)
-
-
-class EjectWorker(QThread):
-    def __init__(self, drive):
-        super().__init__()
-        self.drive, self.ok, self.msg = drive, False, ""
-
-    def run(self):
-        self.ok, self.msg = engine.eject(self.drive)
 
 
 class UpdateCheckWorker(QThread):
@@ -317,8 +307,6 @@ class MainWindow(QMainWindow):
         self.settings = engine.load_settings()
         self.scanners: list[ScanWorker] = []
         self.copier: CopyWorker | None = None
-        self.ejector: EjectWorker | None = None
-        self.ejected: set[str] = set()
         self._upd_check = None
         self._upd_apply = None
         self._copy_t0 = 0.0
@@ -404,14 +392,6 @@ class MainWindow(QMainWindow):
         b = QPushButton("Add a folder…")
         b.clicked.connect(self.add_folder)
         row.addWidget(b)
-        self.b_eject = QToolButton()
-        self.b_eject.setText("Eject card")
-        self.b_eject.setPopupMode(QToolButton.InstantPopup)
-        self.eject_menu = QMenu(self)
-        self.eject_menu.aboutToShow.connect(self._fill_eject_menu)
-        self.b_eject.setMenu(self.eject_menu)
-        self.b_eject.setToolTip("Safely remove a memory card or drive once its files are done")
-        row.addWidget(self.b_eject)
         self.summary = QLabel("")
         row.addWidget(self.summary, 1)
         self.b_clear = QPushButton("Clear list")
@@ -522,8 +502,7 @@ class MainWindow(QMainWindow):
             "• A file that's exactly the same as one already in the library (byte for byte) is skipped.\n"
             "• A different file with the same name gets a number added: IMG_0001_1.CR2.\n"
             "• Nothing in the library is ever overwritten, and nothing on your cards is changed or deleted.\n"
-            "• Every copy is checked against the original before it's kept.\n"
-            "• When a card is done, use Eject card to remove it safely."))
+            "• Every copy is checked against the original before it's kept."))
 
     # ------------------------------------------------------------ destination
     def dest(self) -> Path | None:
@@ -615,7 +594,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_NAME, "The new drive isn't connected. Plug it in first.")
             return
         s = ScanWorker(paths, self.settings, dest)
-        self.ejected -= s.drives
         s.found.connect(self._found)
         s.status.connect(lambda t: self.copier is None and self.status.setText(t))
         s.finished.connect(lambda: self._scan_done(s))
@@ -779,12 +757,10 @@ class MainWindow(QMainWindow):
         if c.cancelled:
             msg += "\n\nPress Start copying to carry on where it stopped."
         self.status.setText(msg.replace("\n\n", "  ").replace("\n", " · "))
-        drives = self._ejectable()
         box = QMessageBox(QMessageBox.Information if not (errors or c.error) else QMessageBox.Warning,
                           APP_NAME, msg, parent=self)
         b_open = box.addButton("Open library", QMessageBox.ActionRole)
         b_log = box.addButton("Open log", QMessageBox.ActionRole) if c.log_path else None
-        b_ej = {box.addButton(f"Eject {self._drive_name(d)}", QMessageBox.ActionRole): d for d in drives[:2]}
         box.addButton(QMessageBox.Close)
         box.exec()
         clicked = box.clickedButton()
@@ -792,57 +768,6 @@ class MainWindow(QMainWindow):
             open_path(self.dest())
         elif b_log is not None and clicked is b_log:
             open_path(c.log_path)
-        elif clicked in b_ej:
-            self.eject(b_ej[clicked])
-
-    # ------------------------------------------------------------------ eject
-    @staticmethod
-    def _drive_name(d: str) -> str:
-        return d.rstrip("\\") if os.name == "nt" else Path(d).name
-
-    def _ejectable(self) -> list[str]:
-        """Drives files came from whose files are all finished and that aren't being read."""
-        dest = self.dest()
-        busy = set().union(*(s.drives for s in self.scanners)) if self.scanners else set()
-        state: dict[str, bool] = {}
-        for it in self.model.items:
-            d = engine.drive_of(it.src)
-            if not d:
-                continue
-            state[d] = state.get(d, True) and it.status != "Waiting"
-        return sorted(d for d, finished in state.items()
-                      if finished and d not in busy and d not in self.ejected and os.path.exists(d)
-                      and engine.can_eject(d, dest))
-
-    def _fill_eject_menu(self):
-        self.eject_menu.clear()
-        drives = self._ejectable()
-        if not drives:
-            a = self.eject_menu.addAction("No finished cards to eject")
-            a.setEnabled(False)
-            return
-        for d in drives:
-            a = self.eject_menu.addAction(f"Eject {self._drive_name(d)}")
-            a.triggered.connect(lambda _=False, d=d: self.eject(d))
-
-    def eject(self, drive: str):
-        if self.ejector:
-            return
-        w = self.ejector = EjectWorker(drive)
-        self.status.setText(f"Ejecting {self._drive_name(drive)}…")
-
-        def done():
-            self.ejector = None
-            if w.ok:
-                self.ejected.add(drive)
-                self.status.setText(w.msg)
-                QMessageBox.information(self, "Eject", w.msg)
-            else:
-                self.status.setText(w.msg)
-                QMessageBox.warning(self, "Eject", w.msg)
-
-        w.finished.connect(done)
-        w.start()
 
     def _update_buttons(self):
         busy = bool(self.copier)
