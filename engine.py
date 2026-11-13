@@ -926,6 +926,13 @@ def _join(folder: str, name: str) -> str:
     return (Path(folder) / name).as_posix() if folder else name
 
 
+STEP = {"now": ""}      # what the copy is doing at this moment, for stall reports
+
+
+def _drive(p: Path) -> str:
+    return str(volume_root(p)).rstrip("\\/") or str(p)
+
+
 def safe_copy(src: Path, dest: Path, cancel=lambda: False, on_bytes=None) -> str:
     """Copy src to dest without ever overwriting anything, and check the copy.
     Returns the checksum. Raises on any problem (and leaves nothing half-written behind)."""
@@ -935,7 +942,17 @@ def safe_copy(src: Path, dest: Path, cancel=lambda: False, on_bytes=None) -> str
     tmp = dest.with_name(f"{PART_PREFIX}{uuid.uuid4().hex[:12]}.part")
     h = hashlib.blake2b(digest_size=20)
     try:
-        with open(L(src), "rb") as fi, open(L(tmp), "xb") as fo:
+        # opened one at a time, so a stall report shows which drive stopped answering
+        STEP["now"] = f"opening the original on {_drive(src)} ({src.name})"
+        fi = open(L(src), "rb")
+        STEP["now"] = f"creating the copy on the library drive {_drive(dest)}"
+        try:
+            fo = open(L(tmp), "xb")
+        except BaseException:
+            fi.close()
+            raise
+        with fi, fo:
+            STEP["now"] = f"copying {src.name} from {_drive(src)} to {_drive(dest)}"
             total, done = os.fstat(fi.fileno()).st_size, 0
             while True:
                 if cancel():
@@ -948,6 +965,7 @@ def safe_copy(src: Path, dest: Path, cancel=lambda: False, on_bytes=None) -> str
                 done += len(b)
                 if on_bytes and total > 16 * CHUNK:
                     on_bytes("Copying", done, total)
+            STEP["now"] = f"saving the copy to the library drive {_drive(dest)}"
             fo.flush()
             os.fsync(fo.fileno())
         src_hash = h.hexdigest()
@@ -955,11 +973,14 @@ def safe_copy(src: Path, dest: Path, cancel=lambda: False, on_bytes=None) -> str
             shutil.copystat(L(src), L(tmp))
         except OSError:
             pass
+        STEP["now"] = f"reading the copy back from {_drive(dest)} to check it"
         check = (lambda d, t: on_bytes("Checking the copy of", d, t)) if on_bytes else None
         if file_hash(tmp, cancel, check) != src_hash:
             raise IOError("The copy didn't match the original (the card or drive may have a read/write "
                           "problem). It was not kept.")
+        STEP["now"] = f"naming the finished copy on {_drive(dest)}"
         _place(tmp, dest)
+        STEP["now"] = ""
         return src_hash
     except BaseException:
         try:

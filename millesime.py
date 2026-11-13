@@ -1223,10 +1223,14 @@ class MainWindow(QMainWindow):
         idle = time.monotonic() - c.last_activity
         if idle > 300 and time.monotonic() - self._stall_logged > 600:
             self._stall_logged = time.monotonic()
-            engine.log_error(f"No progress for {int(idle // 60)} minutes while: {c.activity}",
+            step = engine.STEP.get("now") or ""
+            engine.log_error(f"No progress for {int(idle // 60)} minutes while: {c.activity}"
+                             + (f" — stuck {step}" if step else ""),
                              "Where each part of the program is:\n" + engine.thread_dump())
-            self.status.setText(f"No progress for {int(idle // 60)} minutes on: {c.activity}. The card may have a "
-                                "bad spot. You can press Stop, and Help › Report a problem… makes a report to send.")
+            self.status.setText(f"No progress for {int(idle // 60)} minutes"
+                                + (f", stuck {step}" if step else f" on: {c.activity}")
+                                + ". That drive has stopped answering Windows. Help › Report a problem… makes a "
+                                "report to send.")
 
     def report_problem(self):
         c, h = self.copier, self.healer
@@ -1234,7 +1238,7 @@ class MainWindow(QMainWindow):
                  "copying": bool(c), "scanning": len(self.scanners), "health check": bool(h),
                  "status line": self.status.text()}
         if c:
-            state.update({"current step": c.activity, "paused": c.paused,
+            state.update({"current step": c.activity, "inside the copy": engine.STEP.get("now") or "-", "paused": c.paused,
                           "seconds since last progress": int(time.monotonic() - c.last_activity),
                           "queued": len(c.queue)})
         counts: dict = {}
