@@ -142,69 +142,113 @@ class CopyWorker(QThread):
     file_progress = Signal(str)              # inside a big file: "MVI_0042.MOV · 3.1 of 12.4 GB"
 
     RETRIES = 2                              # a flaky card reader often works on the second try
-    BREAK_EVERY = 10 * 60                    # gentle mode: a short break every 10 minutes …
-    BREAK_FOR = 30                           # … of 30 seconds
 
-    def __init__(self, items, rows, dest, more_coming, gentle=True):
+    def __init__(self, items, rows, dest, more_coming, settings: dict):
         super().__init__()
-        self.gentle = gentle
-        self._worked_since = time.monotonic()
         self.items, self.dest = items, dest
         self.queue: deque[int] = deque(rows)   # files dropped while copying are added here
         self.more_coming = more_coming
+        self.settings = settings               # the window's settings: changes apply while copying
         self.stop = False
         self.paused = False
         self.error = ""
         self.log_path = None
+        self.report_path = None
+        self.report = ""
         self.cancelled = False
         self.activity = "Starting"
         self.last_activity = time.monotonic()
         self.gone_drives: set[str] = set()
         self.leftovers = 0
-
-    def _take_break(self):
-        before = self.activity
-        end = time.monotonic() + self.BREAK_FOR
-        while not self.stop and self.gentle and time.monotonic() < end:
-            left = int(end - time.monotonic()) + 1
-            self.status.emit(f"Gentle mode: a short break so the drives can catch up ({left} s)…")
-            self.activity = "Gentle-mode break"
-            self.last_activity = time.monotonic()
-            time.sleep(1)
-            while self.paused and not self.stop:
-                time.sleep(0.2)
-                end += 0.2
-        self.activity = before
         self._worked_since = time.monotonic()
+        self._tick = time.monotonic()          # last sign of life from the file being copied
+        self.hung: list[str] = []
+        self.stats = {"bytes": 0, "retries": 0, "breaks": 0, "break_s": 0.0, "slow": [], "checked": 0,
+                      "check_bad": 0, "copied_bytes": 0, "started": time.monotonic()}
+
+    @property
+    def gentle(self) -> bool:
+        return bool(self.settings.get("gentle", True))
 
     def _touch(self, what: str):
         self.activity = what
         self.last_activity = time.monotonic()
 
+    def _take_break(self):
+        before = self.activity
+        length = max(5, int(self.settings.get("break_for_s", 30)))
+        t0 = time.monotonic()
+        end = t0 + length
+        self.stats["breaks"] += 1
+        while not self.stop and self.gentle and time.monotonic() < end:
+            left = int(end - time.monotonic()) + 1
+            self.status.emit(f"Gentle mode: a short break so the drives can catch up ({left} s)…")
+            self.activity = "Gentle-mode break"
+            self.last_activity = self._tick = time.monotonic()
+            time.sleep(1)
+            while self.paused and not self.stop:
+                time.sleep(0.2)
+                end += 0.2
+                self._tick = time.monotonic()
+        self.stats["break_s"] += time.monotonic() - t0
+        self.activity = before
+        self._worked_since = self._tick = time.monotonic()
+
+    def cancel(self) -> bool:
+        """Called for every piece of every file: where Pause, breaks and Stop take effect."""
+        self._tick = self.last_activity = time.monotonic()
+        while self.paused and not self.stop:
+            time.sleep(0.2)
+            self._tick = self.last_activity = time.monotonic()
+            self._worked_since = time.monotonic()
+        every = max(1, int(self.settings.get("break_every_min", 10))) * 60
+        if self.gentle and not self.stop and time.monotonic() - self._worked_since > every:
+            self._take_break()
+        engine.THROTTLE.mb_per_s = float(self.settings.get("speed_limit_mb", 0) or 0)
+        return self.stop
+
+    def _run_item(self, it, index, guard, on_bytes, holder, token):
+        # each file gets its own "given up" switch: a hung file that wakes up later stops for good,
+        # even if other files are being copied by then
+        cancel = lambda: True if token["abandon"] else self.cancel()
+        try:
+            engine.process(it, index, cancel, guard, on_bytes)
+        except BaseException as e:      # handed to the worker, which decides what it means
+            holder["error"] = e
+
+    def _process_watched(self, it, index, guard, on_bytes):
+        """Copy one file in a helper thread and watch it. Returns 'hung' if it stopped responding."""
+        import threading
+        holder: dict = {}
+        token = {"abandon": False}
+        self._tick = time.monotonic()
+        t = threading.Thread(target=self._run_item, args=(it, index, guard, on_bytes, holder, token), daemon=True,
+                             name=f"copy {it.src.name}")
+        t.start()
+        while t.is_alive():
+            t.join(0.5)
+            limit = int(self.settings.get("hang_s", 120) or 0)
+            if limit and not self.paused and time.monotonic() - self._tick > limit:
+                token["abandon"] = True       # if it ever wakes up it stops and removes its half-copy
+                return "hung"
+        if "error" in holder:
+            raise holder["error"]
+        return "ok"
+
     def run(self):
         started = datetime.now()
         engine.keep_awake(True)
-
-        def cancel():
-            # also where Pause and gentle-mode breaks take effect, even in the middle of a big file
-            while self.paused and not self.stop:
-                time.sleep(0.2)
-                self.last_activity = time.monotonic()
-                self._worked_since = time.monotonic()
-            if self.gentle and not self.stop and time.monotonic() - self._worked_since > self.BREAK_EVERY:
-                self._take_break()
-            return self.stop
-
         if self.gentle:
             engine.low_priority(True)
         log = store = index = None
         last_emit = [0.0]
+        copied_rows: list[int] = []
         try:
             self._touch("Checking what's already in the library")
             self.status.emit("Checking what's already on the destination drive…")
             index = engine.DestIndex(self.dest)
             index.build(lambda n: (self._touch(f"Checking the library ({n:,} files)"),
-                                   self.status.emit(f"Checking what's already on the drive… {n:,} files")), cancel)
+                                   self.status.emit(f"Checking what's already on the drive… {n:,} files")), self.cancel)
             self.leftovers = index.leftovers
             guard = engine.Guard(self.dest)
             log = engine.LogWriter(self.dest, started)
@@ -212,7 +256,7 @@ class CopyWorker(QThread):
             store = engine.CardStore(self.dest)
             done, done_bytes = 0, 0
             while True:
-                if cancel():
+                if self.cancel():
                     self.cancelled = True
                     break
                 if not self.queue:
@@ -235,16 +279,28 @@ class CopyWorker(QThread):
                 self.status.emit(f"Copying {it.src.name}  →  {it.folder.replace('/', ' › ')}")
 
                 def on_bytes(what, d, t, name=it.src.name):
-                    self.last_activity = time.monotonic()
                     now = time.monotonic()
                     if now - last_emit[0] > 0.3 or d >= t:
                         last_emit[0] = now
                         self.file_progress.emit(f"{what} {name} · {engine.human_size(d)} of {engine.human_size(t)}")
 
+                t_file = time.monotonic()
                 stop_run = False
                 for attempt in range(self.RETRIES + 1):
                     try:
-                        engine.process(it, index, cancel, guard, on_bytes)
+                        if self._process_watched(it, index, guard, on_bytes) == "hung":
+                            where = engine.STEP.get("now") or "copying"
+                            self.hung.append(f"{it.src} (stuck {where})")
+                            engine.log_error(f"Gave up on a file that stopped responding: {it.src}",
+                                             f"Stuck {where}.\n" + engine.thread_dump())
+                            it.status, it.dest = "Error", ""
+                            it.note = (f"Stopped responding for over {self.settings.get('hang_s', 120)} s "
+                                       f"(stuck {where}), so it was skipped. Press Start copying to try again.")
+                            if len(self.hung) >= 2:
+                                self.error = ("A second file stopped responding, so copying was stopped to protect "
+                                              f"the drives. Last one stuck {where}. Check that drive's cable, power "
+                                              "and health before carrying on.")
+                                stop_run = True
                         break
                     except engine.Cancelled:
                         it.status, it.note, it.dest = "Waiting", "", ""
@@ -273,24 +329,34 @@ class CopyWorker(QThread):
                             it.note = "Its card or drive was unplugged. Plug it back in and press Start copying."
                             break
                         if (attempt < self.RETRIES and not isinstance(e, (FileNotFoundError, PermissionError))
-                                and getattr(e, "errno", None) != 22):    # 22: Windows refused the name; retrying won't help
+                                and getattr(e, "errno", None) != 22):    # 22: Windows refused the name
+                            self.stats["retries"] += 1
                             engine.log_error(f"Copying {it.src} (attempt {attempt + 1}, trying again)", e)
                             self.status.emit(f"Couldn't read {it.src.name}, trying again…")
                             time.sleep(2)
                             continue
                         engine.log_error(f"Copying {it.src}", e)
                         it.status, it.note = "Error", str(e)
+                if it.status in ("Copied", "Copied (renamed)"):
+                    copied_rows.append(r)
+                    self.stats["copied_bytes"] += it.size
+                    secs = time.monotonic() - t_file
+                    if it.size > 50 * 1024 * 1024 and secs > 0 and it.size / secs < 5 * 1024 * 1024:
+                        self.stats["slow"].append((it.size / secs, it.src))
                 if it.status != "Waiting":
                     log.write(it)
                     store.record(it, engine.source_key(it.src)[1] if it.source_id else "")
                     done += 1
                     done_bytes += it.size
+                    self.stats["bytes"] = done_bytes
                     self.progress.emit(done, done + len(self.queue), done_bytes)
                 self.row_done.emit(r)
                 if stop_run:
                     break
                 if done and done % 200 == 0:
                     index.save(drop_missing=False)
+            if copied_rows and not self.stop and not self.error and self.settings.get("final_check", True):
+                self._final_check(copied_rows, index, log)
         except engine.Cancelled:
             self.cancelled = True
         except Exception as e:
@@ -299,6 +365,7 @@ class CopyWorker(QThread):
         finally:
             engine.keep_awake(False)
             engine.low_priority(False)
+            engine.THROTTLE.mb_per_s = 0
             self._touch("Saving the library records")
             for closer in ((lambda: index.save(drop_missing=False)) if index else None,
                            index.close if index else None,
@@ -311,7 +378,84 @@ class CopyWorker(QThread):
                         engine.log_error("Finishing up", e)
             if engine.exists(self.dest):
                 engine.backup_db(self.dest)
+            self._write_report(started)
             self._touch("Finished")
+
+    def _final_check(self, rows, index, log):
+        """Re-read every file copied in this run straight from the drive (not from memory) and compare."""
+        total = len(rows)
+        for k, r in enumerate(rows):
+            if self.cancel():
+                return
+            it = self.items[r]
+            self._touch(f"Final check of {it.dest}")
+            self.status.emit(f"Final check: re-reading this run's copies from the drive itself… {k + 1:,} of {total:,}")
+            self.progress.emit(k, total, 0)
+            p = self.dest / it.dest
+            try:
+                want = index.info.get(it.dest, [0, 0, ""])[2]
+                got = engine.disk_hash(p, self.cancel)
+            except engine.Cancelled:
+                return
+            except Exception as e:
+                engine.log_error(f"Final check of {p}", e)
+                got = ""
+            self.stats["checked"] += 1
+            if want and got != want:
+                self.stats["check_bad"] += 1
+                bad = p.with_name(p.name + ".damaged-copy")
+                try:
+                    os.rename(engine.L(p), engine.L(bad))      # set aside, never deleted
+                except OSError:
+                    pass
+                index.info.pop(it.dest, None)
+                engine.log_error(f"Final check: the copy of {it.src} on the drive doesn't match", "Set aside as "
+                                 f"{bad.name}; the original on the card is untouched.")
+                it.status, it.dest = "Error", ""
+                it.note = ("The copy on the drive didn't match when re-read (set aside as .damaged-copy). "
+                           "Press Start copying to copy it again, and run a health check on the drive.")
+                log.write(it)
+                self.row_done.emit(r)
+        self.progress.emit(total, total, 0)
+
+    def _write_report(self, started):
+        st = self.stats
+        secs = max(1.0, time.monotonic() - st["started"])
+        work = max(1.0, secs - st["break_s"])
+        lines = [f"Run started {started:%Y-%m-%d %H:%M}, took {int(secs // 3600)} h {int(secs % 3600 // 60)} min",
+                 f"Copied {engine.human_size(st['copied_bytes'])} of new files; went through "
+                 f"{engine.human_size(st['bytes'])} in all",
+                 f"Average speed {engine.human_size(st['bytes'] / work)}/s (not counting breaks)",
+                 f"Gentle-mode breaks: {st['breaks']} ({int(st['break_s'] // 60)} min)",
+                 f"Speed limit: {self.settings.get('speed_limit_mb') or 'none'}"
+                 + (" MB/s" if self.settings.get('speed_limit_mb') else ""),
+                 f"Read problems retried: {st['retries']}",
+                 f"Files that stopped responding: {len(self.hung)}"]
+        lines += [f"  · {h}" for h in self.hung]
+        if st["slow"]:
+            lines.append(f"Unusually slow files (under 5 MB/s): {len(st['slow'])}")
+            drives: dict[str, int] = {}
+            for _speed, src in st["slow"]:
+                d = str(engine.volume_root(src))
+                drives[d] = drives.get(d, 0) + 1
+            lines += [f"  · from {d}: {n}" for d, n in drives.items()]
+            lines += [f"  · {engine.human_size(sp)}/s  {src}" for sp, src in sorted(st["slow"])[:5]]
+        if st["checked"]:
+            lines.append(f"Final check (re-read from the drive): {st['checked']:,} files, "
+                         f"{st['check_bad']:,} didn't match")
+        if self.gone_drives:
+            lines.append("Unplugged during copying: " + ", ".join(sorted(self.gone_drives)))
+        if self.error:
+            lines.append(f"Stopped: {self.error}")
+        self.report = "\n".join(lines)
+        try:
+            d = self.dest / engine.META_NAME / engine.LOGS_NAME
+            os.makedirs(engine.L(d), exist_ok=True)
+            self.report_path = d / f"{started:%Y-%m-%d_%H%M%S}_run-report.txt"
+            with open(engine.L(self.report_path), "w", encoding="utf-8") as f:
+                f.write(self.report + "\n")
+        except Exception as e:
+            engine.log_error("Writing the run report", e)
 
 
 class HealthWorker(QThread):
@@ -785,6 +929,9 @@ class MainWindow(QMainWindow):
         self.a_gentle.setChecked(self.settings.get("gentle", True))
         self.a_gentle.toggled.connect(self._set_gentle)
         m.addAction(self.a_gentle)
+        a = QAction("Gentle and safe copying settings…", self)
+        a.triggered.connect(self.gentle_settings)
+        m.addAction(a)
         self.a_notify = QAction("Notify me when copying finishes", self, checkable=True)
         self.a_notify.setChecked(self.settings.get("notify", True))
         self.a_notify.toggled.connect(lambda on: (self.settings.__setitem__("notify", on),
@@ -1089,8 +1236,7 @@ class MainWindow(QMainWindow):
             it.note = "Backed up before" if it.known_dest else ""
         engine.plan([self.model.items[r] for r in rows], self.settings, {}, self.aliases)
         self.model.refresh_all()
-        c = self.copier = CopyWorker(self.model.items, rows, dest, lambda: bool(self.scanners),
-                                     gentle=self.settings.get("gentle", True))
+        c = self.copier = CopyWorker(self.model.items, rows, dest, lambda: bool(self.scanners), self.settings)
         c.status.connect(self.status.setText)
         c.file_progress.connect(self.status.setText)
         c.row_done.connect(self._row_done)
@@ -1176,6 +1322,14 @@ class MainWindow(QMainWindow):
         if c.leftovers:
             msg += (f"\n\n{c.leftovers:,} half-finished copies from an earlier crash or power cut were "
                     "cleaned up (only the program's own temporary files).")
+        if c.hung:
+            msg += f"\n\n{len(c.hung)} file(s) stopped responding and were skipped (see the Note column)."
+        if c.stats.get("check_bad"):
+            msg += (f"\n\nThe final check found {c.stats['check_bad']:,} copies that didn't match when read back "
+                    "from the drive. They were set aside (not deleted) and will be copied again next time. Run a "
+                    "health check on the drive.")
+        elif c.stats.get("checked"):
+            msg += f"\n\nFinal check: all {c.stats['checked']:,} new copies re-read from the drive and match."
         if c.cancelled or (c.error and any(it.status == "Waiting" for it in self.model.items)):
             msg += "\n\nPress Start copying to carry on where it stopped."
         self.status.setText(msg.replace("\n\n", "  ").replace("\n", " · "))
@@ -1185,6 +1339,8 @@ class MainWindow(QMainWindow):
                           APP_NAME, msg, parent=self)
         b_open = box.addButton("Open library", QMessageBox.ActionRole)
         b_log = box.addButton("Open log", QMessageBox.ActionRole) if c.log_path else None
+        if c.report:
+            box.setDetailedText(c.report)       # the run report: speed, breaks, retries, slow files, stalls
         box.addButton(QMessageBox.Close)
         box.exec()
         clicked = box.clickedButton()
@@ -1523,9 +1679,56 @@ class MainWindow(QMainWindow):
     def _set_gentle(self, on: bool):
         self.settings["gentle"] = on
         engine.save_settings(self.settings)
-        if self.copier:
-            self.copier.gentle = on      # breaks start or stop right away (priority changes next run)
-            self.status.setText("Gentle mode on." if on else "Gentle mode off: full speed.")
+        if self.copier:                  # breaks start or stop right away (priority changes next run)
+            self.status.setText("Gentle mode on." if on else "Gentle mode off: no breaks.")
+
+    def gentle_settings(self):
+        """Speed limit, breaks, final check and how long a stuck file is waited for."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Gentle and safe copying")
+        g = QGridLayout(dlg)
+
+        def spin(lo, hi, val, suffix, special=""):
+            b = QSpinBox()
+            b.setRange(lo, hi)
+            b.setValue(int(val))
+            b.setSuffix(suffix)
+            if special:
+                b.setSpecialValueText(special)
+            return b
+
+        st = self.settings
+        c_gentle = QCheckBox("Gentle mode: low priority, and regular breaks")
+        c_gentle.setChecked(st.get("gentle", True))
+        every = spin(1, 240, st.get("break_every_min", 10), " min")
+        length = spin(5, 1800, st.get("break_for_s", 30), " s")
+        speed = spin(0, 2000, st.get("speed_limit_mb", 0), " MB/s", "no limit")
+        hang = spin(0, 3600, st.get("hang_s", 120), " s", "never")
+        c_final = QCheckBox("Final check: at the end, re-read this run's copies from the drive itself")
+        c_final.setChecked(st.get("final_check", True))
+        row = 0
+        g.addWidget(c_gentle, row, 0, 1, 2); row += 1
+        g.addWidget(QLabel("Take a break every"), row, 0); g.addWidget(every, row, 1); row += 1
+        g.addWidget(QLabel("Break length"), row, 0); g.addWidget(length, row, 1); row += 1
+        g.addWidget(QLabel("Speed limit"), row, 0); g.addWidget(speed, row, 1); row += 1
+        tip = QLabel("Around 30–60 MB/s keeps a USB hard drive cool and steady. Applies straight away.")
+        tip.setStyleSheet("color: gray")
+        g.addWidget(tip, row, 0, 1, 2); row += 1
+        g.addWidget(c_final, row, 0, 1, 2); row += 1
+        g.addWidget(QLabel("Skip a file that stops responding for"), row, 0); g.addWidget(hang, row, 1); row += 1
+        tip2 = QLabel("If a second file stops responding too, copying stops completely to protect the drives.")
+        tip2.setStyleSheet("color: gray")
+        g.addWidget(tip2, row, 0, 1, 2); row += 1
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        g.addWidget(btns, row, 0, 1, 2)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        st.update(gentle=c_gentle.isChecked(), break_every_min=every.value(), break_for_s=length.value(),
+                  speed_limit_mb=speed.value(), hang_s=hang.value(), final_check=c_final.isChecked())
+        engine.save_settings(st)
+        self.a_gentle.setChecked(st["gentle"])
 
     def _set_theme(self, key):
         self.settings["theme"] = key

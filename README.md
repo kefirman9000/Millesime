@@ -165,8 +165,22 @@ recording date of MP4/MOV videos. Rows that fell back to the file's own date are
   (`Copying MVI_0042.MOV · 3.1 GB of 12.4 GB`, then `Checking the copy of …`), so a long video never
   looks stuck.
 - **Gentle mode** (on by default, **View** menu): copying runs at low priority so File Explorer and
-  other programs stay responsive, and it takes a 30-second break every 10 minutes so the drives can
-  catch up. Turn it off for full speed; the change takes effect straight away.
+  other programs stay responsive, and it takes regular breaks so the drives can catch up.
+- **View › Gentle and safe copying settings…**
+  - **Breaks:** how often (default every 10 minutes) and how long (default 30 seconds).
+  - **Speed limit:** cap reading and writing at, say, 30–60 MB/s so a USB hard drive never runs
+    flat out. Changes apply straight away, even mid-copy.
+  - **Final check** (on by default): when a run ends, every new copy is read back *from the drive
+    itself* (not from Windows' memory) and compared with the original. A copy that doesn't match
+    is set aside as `.damaged-copy` (never deleted) and copied again next time.
+  - **Skip a file that stops responding** for 2 minutes (adjustable). If a second file stops
+    responding too, copying stops completely to protect the drives, and says which drive it was.
+- **Each file is read once.** Photos that need comparing with the library are read into memory,
+  compared, and copied from there, so cards and old drives aren't read twice.
+- **Run report.** At the end, **Show Details** in the summary lists the time taken, average speed,
+  breaks, retries, unusually slow files (and which drive they came from), files that stopped
+  responding, and the final check. It's saved in the sort logs too, so over a few runs you can see
+  whether a drive is starting to struggle.
 - **Unplugged drives.** If the library drive is unplugged, copying stops cleanly and says so. If a
   card is pulled out, its remaining files wait while the others carry on. Plug it back in and
   press **Start copying** to finish.

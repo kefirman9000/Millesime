@@ -130,6 +130,11 @@ DEFAULT_SETTINGS = {
     "check_updates": True,
     "min_photo_kb": 30,           # skip pictures smaller than this (icons, thumbnails); 0 = keep all
     "gentle": True,               # low priority + short breaks while copying
+    "break_every_min": 10,        # gentle mode: a break every … minutes
+    "break_for_s": 30,            # … lasting this many seconds
+    "speed_limit_mb": 0,          # MB/s cap on reading + writing (0 = no limit)
+    "final_check": True,          # re-read this run's copies from the drive itself at the end
+    "hang_s": 120,                # a file that stops responding this long is skipped (0 = never)
     "theme": "system",            # system, light or dark
     "notify": True,
 }
@@ -708,6 +713,35 @@ def backup_db(lib: Path, keep: int = 5) -> None:
 # --------------------------------------------------------------------------- #
 # Checksums and what's already in the library
 # --------------------------------------------------------------------------- #
+class Throttle:
+    """Keeps reading and writing under a speed limit, so the drives never run flat out."""
+
+    def __init__(self):
+        self.mb_per_s = 0.0
+        self._t = time.monotonic()
+        self._budget = 0.0
+
+    def spend(self, n: int, cancel=lambda: False):
+        if self.mb_per_s <= 0:
+            return
+        rate = self.mb_per_s * 1024 * 1024
+        now = time.monotonic()
+        self._budget = min(rate, self._budget + (now - self._t) * rate)   # at most 1 s of burst
+        self._t = now
+        self._budget -= n
+        while self._budget < 0:
+            if cancel():
+                return
+            wait = min(0.25, -self._budget / rate)
+            time.sleep(wait)
+            now = time.monotonic()
+            self._budget += (now - self._t) * rate
+            self._t = now
+
+
+THROTTLE = Throttle()
+
+
 def file_hash(path: Path, cancel=lambda: False, on_bytes=None) -> str:
     h = hashlib.blake2b(digest_size=20)
     done = 0
@@ -719,6 +753,7 @@ def file_hash(path: Path, cancel=lambda: False, on_bytes=None) -> str:
             b = f.read(CHUNK)
             if not b:
                 break
+            THROTTLE.spend(len(b), cancel)
             h.update(b)
             done += len(b)
             if on_bytes and total > 64 * CHUNK:
@@ -728,6 +763,45 @@ def file_hash(path: Path, cancel=lambda: False, on_bytes=None) -> str:
 
 class Cancelled(Exception):
     pass
+
+
+def disk_hash(path: Path, cancel=lambda: False) -> str:
+    """Checksum read from the drive itself, not from Windows' memory cache, so it proves the copy
+    really landed on the disk. Falls back to a normal read where that isn't possible."""
+    if os.name != "nt":
+        return file_hash(path, cancel)
+    import ctypes
+    from ctypes import wintypes
+    k = ctypes.windll.kernel32
+    k.CreateFileW.restype = wintypes.HANDLE
+    k.VirtualAlloc.restype = ctypes.c_void_p
+    GENERIC_READ, SHARE_READ, OPEN_EXISTING = 0x80000000, 0x1, 3
+    NO_BUFFERING, SEQUENTIAL = 0x20000000, 0x08000000
+    handle = k.CreateFileW(L(path), GENERIC_READ, SHARE_READ, None, OPEN_EXISTING, NO_BUFFERING | SEQUENTIAL, None)
+    if handle in (None, wintypes.HANDLE(-1).value):
+        return file_hash(path, cancel)
+    buf = k.VirtualAlloc(None, CHUNK, 0x3000, 0x04)          # page-aligned, as unbuffered reads need
+    if not buf:
+        k.CloseHandle(handle)
+        return file_hash(path, cancel)
+    h = hashlib.blake2b(digest_size=20)
+    got = wintypes.DWORD(0)
+    try:
+        while True:
+            if cancel():
+                raise Cancelled()
+            if not k.ReadFile(handle, ctypes.c_void_p(buf), CHUNK, ctypes.byref(got), None):
+                raise OSError(ctypes.get_last_error() or 1, "Couldn't read the copy back from the drive")
+            if got.value == 0:
+                break
+            THROTTLE.spend(got.value, cancel)
+            h.update(ctypes.string_at(buf, got.value))
+            if got.value < CHUNK:
+                break
+    finally:
+        k.VirtualFree(ctypes.c_void_p(buf), 0, 0x8000)
+        k.CloseHandle(handle)
+    return h.hexdigest()
 
 
 def walk_files(root: Path, cancel=lambda: False):
@@ -934,7 +1008,7 @@ def _drive(p: Path) -> str:
     return str(volume_root(p)).rstrip("\\/") or str(p)
 
 
-def safe_copy(src: Path, dest: Path, cancel=lambda: False, on_bytes=None) -> str:
+def safe_copy(src: Path, dest: Path, cancel=lambda: False, on_bytes=None, data: bytes | None = None) -> str:
     """Copy src to dest without ever overwriting anything, and check the copy.
     Returns the checksum. Raises on any problem (and leaves nothing half-written behind)."""
     os.makedirs(L(dest.parent), exist_ok=True)
@@ -945,7 +1019,8 @@ def safe_copy(src: Path, dest: Path, cancel=lambda: False, on_bytes=None) -> str
     try:
         # opened one at a time, so a stall report shows which drive stopped answering
         STEP["now"] = f"opening the original on {_drive(src)} ({src.name})"
-        fi = open(L(src), "rb")
+        import io
+        fi = io.BytesIO(data) if data is not None else open(L(src), "rb")   # already read once: not again
         STEP["now"] = f"creating the copy on the library drive {_drive(dest)}"
         try:
             fo = open(L(tmp), "xb")
@@ -954,15 +1029,18 @@ def safe_copy(src: Path, dest: Path, cancel=lambda: False, on_bytes=None) -> str
             raise
         with fi, fo:
             STEP["now"] = f"copying {src.name} from {_drive(src)} to {_drive(dest)}"
-            total, done = os.fstat(fi.fileno()).st_size, 0
+            total, done = (len(data) if data is not None else os.fstat(fi.fileno()).st_size), 0
             while True:
                 if cancel():
                     raise Cancelled()
                 b = fi.read(CHUNK)
                 if not b:
                     break
+                if data is None:
+                    THROTTLE.spend(len(b), cancel)
                 h.update(b)
                 fo.write(b)
+                THROTTLE.spend(len(b), cancel)
                 done += len(b)
                 if on_bytes and total > 16 * CHUNK:
                     on_bytes("Copying", done, total)
@@ -979,6 +1057,8 @@ def safe_copy(src: Path, dest: Path, cancel=lambda: False, on_bytes=None) -> str
         if file_hash(tmp, cancel, check) != src_hash:
             raise IOError("The copy didn't match the original (the card or drive may have a read/write "
                           "problem). It was not kept.")
+        if cancel():                      # stopped (or given up on) while checking: don't keep it
+            raise Cancelled()
         STEP["now"] = f"naming the finished copy on {_drive(dest)}"
         _place(tmp, dest)
         STEP["now"] = ""
@@ -1037,12 +1117,19 @@ def process(item: Item, index: DestIndex, cancel=lambda: False, guard: Guard | N
     """Copy one item (with its sidecars). Sets item.status, item.dest and item.note.
     on_bytes(what, done, total) reports progress inside big files."""
     root = index.root
-    cache: dict[str, str] = {}
+    cache: dict = {}
     say = (lambda what: (lambda d, t: on_bytes(what, d, t))) if on_bytes else (lambda what: None)
 
     def src_hash():
+        # photos are read into memory once: compared, and then (if new) copied from memory, so the
+        # card or old drive is read a single time. Big videos are read again only if they need copying.
         if "h" not in cache:
-            cache["h"] = file_hash(item.src, cancel, say("Comparing"))
+            if item.size <= MEM_READ_LIMIT:
+                data = _read_all(item.src, cancel, say("Reading"))
+                cache["data"] = data
+                cache["h"] = hashlib.blake2b(data, digest_size=20).hexdigest()
+            else:
+                cache["h"] = file_hash(item.src, cancel, say("Comparing"))
         return cache["h"]
 
     if item.known_dest:
@@ -1068,7 +1155,7 @@ def process(item: Item, index: DestIndex, cancel=lambda: False, guard: Guard | N
     rel = _join(item.folder, name)
     for _ in range(50):
         try:
-            h = safe_copy(item.src, root / rel, cancel, on_bytes)
+            h = safe_copy(item.src, root / rel, cancel, on_bytes, cache.get("data"))
             break
         except FileExistsError:          # appeared meanwhile: never overwrite, pick the next number
             index.taken.add(rel.lower())
@@ -1102,6 +1189,28 @@ def process(item: Item, index: DestIndex, cancel=lambda: False, guard: Guard | N
             raise
         except Exception as e:
             item.note = (item.note + "; " if item.note else "") + f"sidecar {car.name} not copied: {e}"
+
+
+MEM_READ_LIMIT = 256 * 1024 * 1024
+
+
+def _read_all(p: Path, cancel, on_bytes=None) -> bytes:
+    STEP["now"] = f"reading the original on {_drive(p)} ({p.name})"
+    parts, done = [], 0
+    with open(L(p), "rb") as f:
+        total = os.fstat(f.fileno()).st_size
+        while True:
+            if cancel():
+                raise Cancelled()
+            b = f.read(CHUNK)
+            if not b:
+                break
+            THROTTLE.spend(len(b), cancel)
+            parts.append(b)
+            done += len(b)
+            if on_bytes and total > 16 * CHUNK:
+                on_bytes(done, total)
+    return b"".join(parts)
 
 
 def _size(p: Path) -> int:
