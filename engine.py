@@ -101,6 +101,7 @@ UNDATED = "Undated"
 
 RAW_SPLIT = {
     "together": "RAW and JPEG together",
+    "raw_sub": "JPEG in the folder, RAW in a RAW folder inside it",
     "split": "RAW and JPEG in separate RAW / JPEG folders",
 }
 CAMERA_VIDEOS = {
@@ -536,6 +537,8 @@ def plan(items: list[Item], s: dict, album_of_dir: dict | None = None, aliases: 
             f = f"{LIB['photo']}/{date_folder(it.taken, layout)}"
             if s.get("raw_split") == "split":
                 f += "/RAW" if it.kind == "raw" else "/JPEG"
+            elif s.get("raw_split") == "raw_sub" and it.kind == "raw":
+                f += "/RAW"
         elif it.kind == "video":
             mode = s.get("camera_videos", "photos_sub") if it.camera else None
             if mode == "photos_sub":

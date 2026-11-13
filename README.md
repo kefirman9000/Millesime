@@ -81,7 +81,7 @@ walk away during long copies (turn it off under **View**).
 |---|---|
 | **Include** | Photos & RAW, Videos, Music, Documents, Everything else |
 | **Photo folders** | Year › Month (`2019\07 - July`), Year › Month › Day, Year › `2019-07`, Year only |
-| **RAW / JPEG** | together, or in separate `RAW` and `JPEG` folders inside each month |
+| **RAW / JPEG** | together; JPEGs in the month folder with RAW files in a `RAW` folder inside it; or separate `RAW` and `JPEG` folders inside each month |
 | **Camera videos** | with their photos in a `Videos` folder (default), mixed in with the photos, or in the Videos library by date |
 | **Other videos** | Videos library by date, or all together in `Videos` |
 | **No date inside** | use the file's own date (what the camera saved), or an `Undated` folder |
