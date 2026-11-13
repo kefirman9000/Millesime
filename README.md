@@ -42,9 +42,34 @@ D:\Library\
 The window shows an example of where each kind of file will go, so you can see the effect of
 each option before you copy anything.
 
+Drop anywhere on the window. While you drag, it says what you're about to add ("Drop to add
+1 drive, 2 folders"). After each drop, a line above the list sums up what was found on that card
+or folder (photos, videos, songs …), whether it was backed up before, and how many tiny pictures
+were skipped.
+
 Before you copy, the **Where files will go** tab shows the folders your files will land in as a
 tree, with how many files and how much space each takes, e.g. `Photos › 2019 › 07 - July (212)`.
 The **All files** tab lists every file. Double-click a folder to open it.
+
+## Naming, moving and skipping
+
+You're never asked to name anything, but you can, right in the **Where files will go** tree:
+
+- **Rename a folder:** right-click › Rename (or press **F2**). Choose **Year › Month › Day** folders
+  and rename a day to `2019-07-04 Smith Wedding`, or rename a whole month. The new name is
+  remembered for this library, so files from that date added later go there too. Folders already
+  on the drive aren't renamed. **Tools › Forget renamed folders** goes back to the normal names.
+- **Move a folder:** drag it onto another folder in the tree, or right-click › Move to… and pick or
+  type a place such as `Photos\Events\Wedding`.
+- **Skip files:** right-click a folder › Skip these files. They're shown as *Skipped* and not
+  copied.
+
+In the **All files** list, select rows and right-click to skip them, include them again, move them
+somewhere else, or put them back where the options say.
+
+**Skip pictures under 30 KB** (next to Include) leaves out icons, thumbnails and web images,
+which real photos never are. RAW files and album covers are always kept. Set it to 0 to keep
+every picture.
 
 While copying you can **Pause** (it stops right away, even in the middle of a big video) and
 **Resume**, or **Stop**. When it finishes you get a Windows notification and a sound, so you can

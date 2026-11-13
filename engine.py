@@ -116,6 +116,7 @@ DEFAULT_SETTINGS = {
     "no_date": "file_date",       # or "undated"
     "auto_start": False,
     "check_updates": True,
+    "min_photo_kb": 30,           # skip pictures smaller than this (icons, thumbnails); 0 = keep all
     "theme": "system",            # system, light or dark
     "notify": True,
 }
@@ -175,6 +176,7 @@ class Item:
     source_id: str = ""            # the card or drive it came from (its volume serial number)
     source_rel: str = ""           # path on that card
     known_dest: str = ""           # backed up from this card before, to here
+    override: str = ""             # folder chosen by hand (Move to…), wins over the options
 
 
 def kind_of(ext: str) -> str:
@@ -207,7 +209,8 @@ def _inside(p: Path, root: Path | None) -> bool:
         return False
 
 
-def gather(paths: list[Path], settings: dict, dest_root: Path | None = None, cancel=lambda: False):
+def gather(paths: list[Path], settings: dict, dest_root: Path | None = None, cancel=lambda: False,
+           stats: dict | None = None):
     """Yield Items for every wanted file under the given files/folders. Sidecars (.xmp etc.) are
     attached to the file they belong to. Anything already inside the destination is skipped."""
     seen: set[str] = set()
@@ -276,6 +279,11 @@ def gather(paths: list[Path], settings: dict, dest_root: Path | None = None, can
                 except OSError:
                     continue
                 size = st.st_size
+                min_kb = int(settings.get("min_photo_kb", 0) or 0)
+                if kind == "photo" and min_kb and size < min_kb * 1024:
+                    if stats is not None:
+                        stats["tiny"] = stats.get("tiny", 0) + 1
+                    continue
                 cars = list(cars_by_key.get(low, []))
                 # IMG_1.xmp next to both IMG_1.CR2 and IMG_1.JPG goes with the RAW
                 if ext in RAW_EXT or stem not in stems_with_raw:
@@ -486,7 +494,22 @@ def read_info(it: Item, settings: dict) -> None:
                 it.album = parent
 
 
-def plan(items: list[Item], s: dict, album_of_dir: dict | None = None) -> None:
+def apply_aliases(folder: str, aliases: dict | None) -> str:
+    """Folder names the user changed. Renaming 'Photos/2019' also moves everything under it."""
+    if not aliases:
+        return folder
+    for _ in range(20):          # renames can build on earlier renames
+        best = ""
+        for k in aliases:
+            if (folder == k or folder.startswith(k + "/")) and len(k) > len(best):
+                best = k
+        if not best or aliases[best] == best:
+            break
+        folder = aliases[best] + folder[len(best):]
+    return folder
+
+
+def plan(items: list[Item], s: dict, album_of_dir: dict | None = None, aliases: dict | None = None) -> None:
     """Decide the folder for every waiting item from the current options. Pass the same
     album_of_dir between batches so album covers find the songs they were next to."""
     layout = s.get("layout", "year_month")
@@ -494,6 +517,9 @@ def plan(items: list[Item], s: dict, album_of_dir: dict | None = None) -> None:
         album_of_dir = {}
     for it in items:
         if it.status != "Waiting":
+            continue
+        if it.override:
+            it.folder = it.override
             continue
         if it.kind in ("raw", "photo"):
             f = f"{LIB['photo']}/{date_folder(it.taken, layout)}"
@@ -521,12 +547,15 @@ def plan(items: list[Item], s: dict, album_of_dir: dict | None = None) -> None:
             f = f"{LIB['other']}/{safe_name(ext, 'No extension') if ext else 'No extension'}"
         else:
             continue
-        it.folder = f
+        it.folder = apply_aliases(f, aliases)
     for it in items:   # album covers go with the songs they were next to
-        if it.status == "Waiting" and it.kind == "art":
-            it.folder = album_of_dir.get(it.src.parent, f"{LIB['music']}/Unknown Artist/Unknown Album")
+        if it.status == "Waiting" and it.kind == "art" and not it.override:
+            it.folder = album_of_dir.get(it.src.parent,
+                                         apply_aliases(f"{LIB['music']}/Unknown Artist/Unknown Album", aliases))
 
 
+KIND_GROUP = {"raw": "photos", "photo": "photos", "video": "videos", "music": "songs", "art": "songs",
+              "doc": "documents", "other": "other files"}
 KIND_LABEL = {"raw": "RAW", "photo": "Photo", "video": "Video", "music": "Music", "art": "Album cover",
               "doc": "Document", "other": "Other"}
 
@@ -1054,3 +1083,33 @@ def last_health_check(lib: Path) -> datetime | None:
         return datetime.fromisoformat(json.loads((lib / META_NAME / "health.json").read_text("utf-8"))["last"])
     except Exception:
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Folder names the user changed, remembered per library
+# --------------------------------------------------------------------------- #
+def load_aliases(lib: Path | None) -> dict:
+    if not lib:
+        return {}
+    try:
+        return json.loads((lib / META_NAME / "folders.json").read_text("utf-8")).get("renamed", {})
+    except Exception:
+        return {}
+
+
+def save_aliases(lib: Path, aliases: dict) -> None:
+    try:
+        d = lib / META_NAME
+        d.mkdir(parents=True, exist_ok=True)
+        _hide(d)
+        tmp = d / "folders.tmp"
+        tmp.write_text(json.dumps({"renamed": aliases}, indent=1), "utf-8")
+        tmp.replace(d / "folders.json")
+    except Exception as e:
+        log_error("Saving renamed folders", e)
+
+
+def clean_folder_path(text: str) -> str:
+    """'Photos\\Events/ Wedding ' -> 'Photos/Events/Wedding', each part made safe for Windows."""
+    parts = [p for p in re.split(r"[\\/]+", text or "") if p.strip()]
+    return "/".join(safe_name(p, "_") for p in parts)

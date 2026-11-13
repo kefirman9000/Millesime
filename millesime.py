@@ -19,7 +19,9 @@ from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QIcon
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
                                QMainWindow, QMessageBox, QProgressBar, QPushButton, QSystemTrayIcon,
-                               QTableView, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+                               QSpinBox, QTableView, QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+                               QWidget, QMenu)
+from PySide6.QtGui import QKeySequence, QShortcut
 
 import engine
 import updater
@@ -78,46 +80,58 @@ def apply_theme(app, mode: str):
 class ScanWorker(QThread):
     found = Signal(list)          # batches of Items, already given their folders
     status = Signal(str)
-    cards = Signal(list)          # [(name, already backed up, new, last backup or None)]
+    sources = Signal(list)        # one summary per dropped card / folder / file
 
-    def __init__(self, paths, settings, dest):
+    def __init__(self, paths, settings, dest, aliases):
         super().__init__()
         self.paths, self.settings, self.dest = paths, dict(settings), dest
+        self.aliases = dict(aliases)
         self.stop = False
 
     def run(self):
         albums: dict = {}
         store = engine.CardStore(self.dest)
-        per_card: dict[str, list] = {}
+        summaries = []
         batch, n, last = [], 0, time.monotonic()
         try:
-            for it in engine.gather(self.paths, self.settings, self.dest, lambda: self.stop):
+            for p in self.paths:
                 if self.stop:
                     break
-                it.source_id, name, it.source_rel = engine.source_key(it.src)
-                c = per_card.setdefault(it.source_id, [name, 0, 0])
-                rec = store.lookup(it)
-                if rec:
-                    store.apply(it, rec)     # known file: its date is remembered, nothing is read from it
-                    it.note = "Backed up before"
-                    c[1] += 1
-                else:
-                    engine.read_info(it, self.settings)
-                    c[2] += 1
-                batch.append(it)
-                n += 1
-                if time.monotonic() - last > 0.25:
-                    engine.plan(batch, self.settings, albums)
-                    self.found.emit(batch)
-                    batch, last = [], time.monotonic()
-                    self.status.emit(f"Reading files… {n:,} found")
+                stats: dict = {}
+                info = {"path": str(p), "name": "", "kinds": {}, "known": 0, "new": 0, "last": None, "tiny": 0}
+                summaries.append(info)
+                for it in engine.gather([p], self.settings, self.dest, lambda: self.stop, stats):
+                    if self.stop:
+                        break
+                    it.source_id, name, it.source_rel = engine.source_key(it.src)
+                    info["name"] = info["name"] or name
+                    if info["last"] is None:
+                        info["last"] = store.last_backup(it.source_id) or False
+                    rec = store.lookup(it)
+                    if rec:
+                        store.apply(it, rec)     # known file: its date is remembered, nothing is read from it
+                        it.note = "Backed up before"
+                        info["known"] += 1
+                    else:
+                        engine.read_info(it, self.settings)
+                        info["new"] += 1
+                    k = engine.KIND_GROUP[it.kind]
+                    info["kinds"][k] = info["kinds"].get(k, 0) + 1
+                    batch.append(it)
+                    n += 1
+                    if time.monotonic() - last > 0.25:
+                        engine.plan(batch, self.settings, albums, self.aliases)
+                        self.found.emit(batch)
+                        batch, last = [], time.monotonic()
+                        self.status.emit(f"Reading files… {n:,} found")
+                info["tiny"] = stats.get("tiny", 0)
         except Exception as e:
             engine.log_error("Scanning", e)
             self.status.emit(f"Problem while reading the files: {e}")
         if batch:
-            engine.plan(batch, self.settings, albums)
+            engine.plan(batch, self.settings, albums, self.aliases)
             self.found.emit(batch)
-        self.cards.emit([(name, known, new, store.last_backup(cid)) for cid, (name, known, new) in per_card.items()])
+        self.sources.emit(summaries)
 
 
 class CopyWorker(QThread):
@@ -257,7 +271,7 @@ class UpdateApplyWorker(QThread):
 # The list of files
 # --------------------------------------------------------------------------- #
 STATUS_COLORS = {"Copied": "#2e9d4f", "Copied (renamed)": "#2b7bd6", "Duplicate": "#8a8a8a",
-                 "Error": "#d23c3c"}
+                 "Error": "#d23c3c", "Skipped": "#b07a1c"}
 
 
 class ItemModel(QAbstractTableModel):
@@ -339,42 +353,94 @@ class ItemModel(QAbstractTableModel):
         self.endResetModel()
 
 
+DROP_TEXT = ("Drop memory cards, old drives or folders anywhere on this window\n\n"
+             "They're only read. Nothing on them is changed. You can keep dropping more while it copies.")
+
+
 class DropZone(QFrame):
-    dropped = Signal(list)
+    """The dashed box. Drops land anywhere on the window; this shows what's being dragged."""
 
     def __init__(self):
         super().__init__()
-        self.setAcceptDrops(True)
         self.setFrameShape(QFrame.StyledPanel)
-        self.setMinimumHeight(110)
+        self.setMinimumHeight(100)
         lay = QVBoxLayout(self)
-        self.label = QLabel("Drop memory cards, old drives or folders here\n\n"
-                            "They're only read. Nothing on them is changed. "
-                            "You can keep dropping more while it copies.")
+        self.label = QLabel(DROP_TEXT)
         self.label.setAlignment(Qt.AlignCenter)
+        self.label.setWordWrap(True)
         f = self.label.font()
         f.setPointSize(f.pointSize() + 3)
         self.label.setFont(f)
         lay.addWidget(self.label)
-        self._style(False)
+        self.hot(False)
 
-    def _style(self, hot):
+    def hot(self, on: bool, text: str = ""):
+        self.label.setText(text if on and text else DROP_TEXT)
         self.setStyleSheet("DropZone { border: 2px dashed %s; border-radius: 12px; %s }"
-                           % ("#2b7bd6" if hot else "#888", "background: rgba(43,123,214,0.12);" if hot else ""))
+                           % ("#2b7bd6" if on else "#888", "background: rgba(43,123,214,0.15);" if on else ""))
+
+
+def describe_drop(paths: list[Path]) -> str:
+    drives = folders = files = 0
+    for p in paths:
+        if p.is_dir() and Path(p.anchor) == p:
+            drives += 1
+        elif p.is_dir():
+            folders += 1
+        else:
+            files += 1
+    bits = [f"{n:,} {w}{'' if n == 1 else 's'}" for n, w in ((drives, "drive"), (folders, "folder"), (files, "file")) if n]
+    return "Drop to add " + ", ".join(bits) if bits else "Drop to add"
+
+
+class FolderTree(QTreeWidget):
+    """'Where files will go'. Drag a folder onto another to move it there; drops from Explorer add files."""
+    moved = Signal(str, str)       # folder, new parent folder
+    urls_dropped = Signal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
+        self.setDefaultDropAction(Qt.MoveAction)
+
+    @staticmethod
+    def key(item) -> str | None:
+        if item is None:
+            return None
+        k = item.data(0, Qt.UserRole)
+        return k if isinstance(k, str) else None
 
     def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls() or e.source() is self:
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
         if e.mimeData().hasUrls():
             e.acceptProposedAction()
-            self._style(True)
-
-    def dragLeaveEvent(self, e):
-        self._style(False)
+            return
+        super().dragMoveEvent(e)
+        target = self.key(self.itemAt(e.position().toPoint()))
+        src = self.key(self.currentItem())
+        if target is None or not src or target == src or target.startswith(src + "/"):
+            e.ignore()
+        else:
+            e.acceptProposedAction()
 
     def dropEvent(self, e):
-        self._style(False)
-        paths = [Path(u.toLocalFile()) for u in e.mimeData().urls() if u.isLocalFile()]
-        if paths:
-            self.dropped.emit(paths)
+        if e.mimeData().hasUrls():
+            self.urls_dropped.emit([Path(u.toLocalFile()) for u in e.mimeData().urls() if u.isLocalFile()])
+            e.acceptProposedAction()
+            return
+        target = self.key(self.itemAt(e.position().toPoint()))
+        src = self.key(self.currentItem())
+        e.ignore()                 # the tree is rebuilt from the files, not moved by Qt
+        if target is not None and src and target != src and not target.startswith(src + "/"):
+            self.moved.emit(src, target)
 
 
 def _combo(options: dict, current: str) -> QComboBox:
@@ -396,6 +462,8 @@ class MainWindow(QMainWindow):
         self.copier: CopyWorker | None = None
         self.healer: HealthWorker | None = None
         self.tray: QSystemTrayIcon | None = None
+        self.aliases: dict = engine.load_aliases(self.dest())
+        self.source_lines: list[str] = []
         self._paused_at = 0.0
         self._upd_check = None
         self._upd_apply = None
@@ -404,6 +472,7 @@ class MainWindow(QMainWindow):
         if ICON_FILE.exists():
             self.setWindowIcon(QIcon(str(ICON_FILE)))
         self.resize(1180, 800)
+        self.setAcceptDrops(True)        # drop anywhere on the window
         self._menus()
 
         w = QWidget()
@@ -439,6 +508,17 @@ class MainWindow(QMainWindow):
             c.setChecked(self.settings.get(k, engine.DEFAULT_SETTINGS[k]))
             c.toggled.connect(self._options_changed)
             inc.addWidget(c)
+        inc.addSpacing(16)
+        inc.addWidget(QLabel("Skip pictures under"))
+        self.tiny_box = QSpinBox()
+        self.tiny_box.setRange(0, 2000)
+        self.tiny_box.setSuffix(" KB")
+        self.tiny_box.setSpecialValueText("off")
+        self.tiny_box.setValue(int(self.settings.get("min_photo_kb", 30)))
+        self.tiny_box.setToolTip("Icons, thumbnails and web images are tiny; real photos never are. "
+                                 "RAW files and album covers are always kept. 0 = keep every picture.")
+        self.tiny_box.valueChanged.connect(self._options_changed)
+        inc.addWidget(self.tiny_box)
         inc.addStretch(1)
         g.addWidget(QLabel("Include:"), 0, 0)
         g.addLayout(inc, 0, 1, 1, 3)
@@ -483,7 +563,6 @@ class MainWindow(QMainWindow):
         v.addWidget(self.cards_label)
 
         self.drop = DropZone()
-        self.drop.dropped.connect(self.add_paths)
         v.addWidget(self.drop)
 
         row = QHBoxLayout()
@@ -524,9 +603,18 @@ class MainWindow(QMainWindow):
         for col, wd in enumerate((200, 110, 200, 320, 120)):
             self.table.setColumnWidth(col, wd)
         self.table.doubleClicked.connect(self._open_row)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._table_menu)
 
-        self.tree = QTreeWidget()
+        self.tree = FolderTree()
         self.tree.setHeaderLabels(["Folder", "Files", "Size"])
+        self.tree.setToolTip("Right-click a folder (or press F2) to rename it, move it or skip its files. "
+                             "Drag a folder onto another to move it there.")
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._tree_menu)
+        self.tree.moved.connect(self._tree_moved)
+        self.tree.urls_dropped.connect(self.add_paths)
+        QShortcut(QKeySequence(Qt.Key_F2), self.tree, activated=lambda: self._rename_folder(self.tree.currentItem()))
         self.tree.setColumnWidth(0, 420)
         self.tree.setColumnWidth(1, 90)
         self.tree.setAlternatingRowColors(True)
@@ -596,6 +684,9 @@ class MainWindow(QMainWindow):
         a = QAction("Check the library for damaged files…", self)
         a.triggered.connect(self.health_check)
         m.addAction(a)
+        a = QAction("Forget renamed folders…", self)
+        a.triggered.connect(self._reset_aliases)
+        m.addAction(a)
 
         m = self.menuBar().addMenu("&Help")
         a = QAction("How it works", self)
@@ -660,6 +751,8 @@ class MainWindow(QMainWindow):
         if d:
             self.settings["destination"] = d
             engine.save_settings(self.settings)
+            self.aliases = engine.load_aliases(Path(d))
+            self._replan()
             self._show_dest()
             self._show_example()
 
@@ -681,15 +774,18 @@ class MainWindow(QMainWindow):
     def _options_changed(self):
         old_inc = {k: self.settings.get(k) for k in self.includes}
         old_nodate = self.settings.get("no_date")
+        old_tiny = self.settings.get("min_photo_kb")
         for k, c in self.includes.items():
             self.settings[k] = c.isChecked()
         self.settings.update(layout=self.layout_box.currentData(), raw_split=self.raw_box.currentData(),
                              camera_videos=self.camvid_box.currentData(),
                              other_videos=self.othervid_box.currentData(),
-                             no_date=self.nodate_box.currentData(), auto_start=self.c_auto.isChecked())
+                             no_date=self.nodate_box.currentData(), auto_start=self.c_auto.isChecked(),
+                             min_photo_kb=self.tiny_box.value())
         engine.save_settings(self.settings)
         changed_scan = (old_inc != {k: self.settings[k] for k in self.includes}
-                        or old_nodate != self.settings["no_date"])
+                        or old_nodate != self.settings["no_date"]
+                        or old_tiny != self.settings["min_photo_kb"])
         if changed_scan and self.model.items and not self.copier:
             self.status.setText("Include / date settings changed. Clear the list and drop the folders again "
                                 "to use them for these files.")
@@ -700,7 +796,7 @@ class MainWindow(QMainWindow):
         """Update where waiting files will go after a folder option changes."""
         if self.copier:
             return
-        engine.plan(self.model.items, self.settings, {})
+        engine.plan(self.model.items, self.settings, {}, self.aliases)
         self.model.refresh_all()
         self._tree_timer.start()
 
@@ -740,9 +836,9 @@ class MainWindow(QMainWindow):
         if not dest.exists():
             QMessageBox.warning(self, APP_NAME, "The new drive isn't connected. Plug it in first.")
             return
-        s = ScanWorker(paths, self.settings, dest)
+        s = ScanWorker(paths, self.settings, dest, self.aliases)
         s.found.connect(self._found)
-        s.cards.connect(self._cards_seen)
+        s.sources.connect(self._sources_seen)
         s.status.connect(lambda t: self.copier is None and self.status.setText(t))
         s.finished.connect(lambda: self._scan_done(s))
         self.scanners.append(s)
@@ -759,17 +855,27 @@ class MainWindow(QMainWindow):
             self.copier.queue.extend(rows)      # joins the copy that's already running
         self._update_summary()
 
-    def _cards_seen(self, cards):
-        lines = []
-        for name, known, new, last in cards:
-            if known and last:
-                lines.append(f"<b>{name}</b> was backed up on {last:%b %d, %Y}: {new:,} new file"
-                             f"{'' if new == 1 else 's'} since then. {known:,} already backed up will be "
-                             "skipped without reading them.")
-            elif new:
-                lines.append(f"<b>{name}</b>: first backup to this library ({new:,} files).")
-        if lines:
-            self.cards_label.setText("<br>".join(lines))
+    def _sources_seen(self, summaries):
+        """One line per card / folder dropped: what was found, and whether it was backed up before."""
+        for info in summaries:
+            p = Path(info["path"])
+            title = info["name"] if Path(p.anchor) == p and info["name"] else (p.name or str(p))
+            total = info["known"] + info["new"]
+            if not total:
+                line = f"<b>{title}</b>: nothing to copy"
+            else:
+                kinds = ", ".join(f"{n:,} {k}" for k, n in sorted(info["kinds"].items(), key=lambda x: -x[1]))
+                line = f"<b>{title}</b>: {total:,} files ({kinds})"
+                if info["known"] and info["last"]:
+                    line += (f" · backed up before on {info['last']:%b %d, %Y}: {info['new']:,} new, "
+                             f"{info['known']:,} already backed up (won't be read again)")
+                elif info["new"]:
+                    line += " · first backup to this library"
+            if info.get("tiny"):
+                line += f" · {info['tiny']:,} tiny pictures skipped"
+            self.source_lines.append(line)
+        if self.source_lines:
+            self.cards_label.setText("<br>".join(self.source_lines[-8:]))
             self.cards_label.show()
 
     def _scan_done(self, s):
@@ -802,14 +908,17 @@ class MainWindow(QMainWindow):
                  "doc": "documents", "other": "other"}[it.kind]
             counts[k] = counts.get(k, 0) + 1
         parts = ", ".join(f"{n:,} {k}" for k, n in counts.items())
-        done = len(items) - len(waiting)
+        skipped = sum(1 for it in items if it.status == "Skipped")
+        done = len(items) - len(waiting) - skipped
         self.summary.setText(f"  {len(waiting):,} to copy ({engine.human_size(size)})"
-                             + (f": {parts}" if parts else "") + (f" · {done:,} done" if done else ""))
+                             + (f": {parts}" if parts else "") + (f" · {done:,} done" if done else "")
+                             + (f" · {skipped:,} skipped by you" if skipped else ""))
 
     def clear(self):
         if self.copier or self.scanners:
             return
         self.model.clear()
+        self.source_lines = []
         self.cards_label.hide()
         self._update_summary()
         self.status.setText("")
@@ -859,7 +968,7 @@ class MainWindow(QMainWindow):
             it = self.model.items[r]
             it.status, it.dest = "Waiting", ""
             it.note = "Backed up before" if it.known_dest else ""
-        engine.plan([self.model.items[r] for r in rows], self.settings, {})
+        engine.plan([self.model.items[r] for r in rows], self.settings, {}, self.aliases)
         self.model.refresh_all()
         c = self.copier = CopyWorker(self.model.items, rows, dest, lambda: bool(self.scanners))
         c.status.connect(self.status.setText)
@@ -956,6 +1065,150 @@ class MainWindow(QMainWindow):
         elif b_log is not None and clicked is b_log:
             open_path(c.log_path)
 
+    # ---------------------------------------------------- drop anywhere
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            paths = [Path(u.toLocalFile()) for u in e.mimeData().urls() if u.isLocalFile()]
+            if paths:
+                e.acceptProposedAction()
+                self.drop.hot(True, describe_drop(paths) + (" (it joins the queue)" if self.copier else ""))
+                return
+        e.ignore()
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dragLeaveEvent(self, e):
+        self.drop.hot(False)
+
+    def dropEvent(self, e):
+        self.drop.hot(False)
+        paths = [Path(u.toLocalFile()) for u in e.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            e.acceptProposedAction()
+            self.add_paths(paths)
+
+    # ------------------------------------------- rename / move / skip by hand
+    def _items_under(self, key: str):
+        return [it for it in self.model.items if it.status == "Waiting"
+                and (not key or it.folder == key or it.folder.startswith(key + "/"))]
+
+    def _tree_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        key = FolderTree.key(item)
+        if key is None or self.copier:
+            return
+        n = len(self._items_under(key))
+        m = QMenu(self)
+        if key:
+            m.addAction("Rename folder…  (F2)", lambda: self._rename_folder(item))
+            m.addAction("Move to…", lambda: self._move_items(self._items_under(key), key))
+        m.addAction(f"Skip these {n:,} files", lambda: self._set_skipped(self._items_under(key), True))
+        m.addSeparator()
+        m.addAction("Open folder", lambda: self._open_tree_item(item, 0))
+        m.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _rename_folder(self, item):
+        key = FolderTree.key(item)
+        if not key or self.copier:
+            return
+        parent, _, name = key.rpartition("/")
+        new, ok = QInputDialog.getText(self, "Rename folder",
+                                       f"New name for “{name}”.\n\nFiles going here now, and ones added later, "
+                                       "go to the new name. Folders already on the drive aren't renamed.",
+                                       text=name)
+        new = engine.safe_name(new, "")
+        if not ok or not new or new == name:
+            return
+        new_key = f"{parent}/{new}" if parent else new
+        for it in self.model.items:        # files moved here by hand follow the rename too
+            if it.status == "Waiting" and it.override and (it.override == key or it.override.startswith(key + "/")):
+                it.override = new_key + it.override[len(key):]
+        self.aliases[key] = new_key
+        if self.dest():
+            engine.save_aliases(self.dest(), self.aliases)
+        self._replan()
+        self.status.setText(f"“{name}” renamed to “{new}”. Tools › Forget renamed folders undoes all renames.")
+
+    def _tree_moved(self, src: str, target: str):
+        if self.copier:
+            return
+        base = (f"{target}/" if target else "") + src.rpartition("/")[2]
+        for it in self._items_under(src):
+            it.override = base + it.folder[len(src):]
+        self._replan()
+        self.status.setText(f"Moved to {base.replace('/', ' › ')}")
+
+    def _move_items(self, items, key_hint: str = ""):
+        if not items or self.copier:
+            return
+        folders = sorted({it.folder for it in self.model.items if it.status == "Waiting"})
+        current = key_hint or items[0].folder
+        text, ok = QInputDialog.getItem(self, "Move to…", f"Put {len(items):,} file(s) in this folder "
+                                        "(pick one, or type a new one such as Photos\\Events\\Wedding):",
+                                        [f.replace("/", "\\") for f in folders], max(0, folders.index(current))
+                                        if current in folders else 0, True)
+        target = engine.clean_folder_path(text)
+        if not ok or not target:
+            return
+        if key_hint:        # moving a whole folder: keep its sub-folders inside the new place
+            for it in items:
+                it.override = target + it.folder[len(key_hint):]
+        else:
+            for it in items:
+                it.override = target
+        self._replan()
+
+    def _set_skipped(self, items, skip: bool):
+        for it in items:
+            if skip and it.status == "Waiting":
+                it.status, it.note = "Skipped", "Skipped by you (not copied)"
+            elif not skip and it.status == "Skipped":
+                it.status, it.note = "Waiting", "Backed up before" if it.known_dest else ""
+        self._replan()
+        self._update_summary()
+        self._update_buttons()
+
+    def _selected_items(self):
+        rows = sorted({i.row() for i in self.table.selectionModel().selectedRows()})
+        return [self.model.items[r] for r in rows]
+
+    def _table_menu(self, pos):
+        if self.copier:
+            return
+        sel = self._selected_items()
+        if not sel:
+            return
+        m = QMenu(self)
+        waiting = [it for it in sel if it.status == "Waiting"]
+        skipped = [it for it in sel if it.status == "Skipped"]
+        if waiting:
+            m.addAction(f"Skip {len(waiting):,} selected", lambda: self._set_skipped(waiting, True))
+            m.addAction("Move selected to…", lambda: self._move_items(waiting))
+            if any(it.override for it in waiting):
+                m.addAction("Put back where the options say",
+                            lambda: ([setattr(it, "override", "") for it in waiting], self._replan()))
+        if skipped:
+            m.addAction(f"Include {len(skipped):,} again", lambda: self._set_skipped(skipped, False))
+        m.addSeparator()
+        m.addAction("Open where it came from", lambda: open_path(sel[0].src.parent))
+        m.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _reset_aliases(self):
+        if not self.aliases:
+            QMessageBox.information(self, "Renamed folders", "No folders have been renamed in this library.")
+            return
+        lines = "\n".join(f"{k.replace('/', ' › ')}  →  {v.rpartition('/')[2]}" for k, v in list(self.aliases.items())[:15])
+        if QMessageBox.question(self, "Forget renamed folders",
+                                f"Go back to the normal folder names for new files?\n\n{lines}\n\nFolders already "
+                                "on the drive keep their names.") != QMessageBox.Yes:
+            return
+        self.aliases = {}
+        if self.dest():
+            engine.save_aliases(self.dest(), self.aliases)
+        self._replan()
+
     # ------------------------------------------------------- folder preview
     def _rebuild_tree(self):
         """A tree of the folders the waiting files will go into, with counts and sizes."""
@@ -989,6 +1242,7 @@ class MainWindow(QMainWindow):
                 n[1] += it.size
         top = QTreeWidgetItem(self.tree, [str(root or "Library"), f"{len(waiting):,}",
                                           engine.human_size(sum(it.size for it in waiting))])
+        top.setData(0, Qt.UserRole, "")
         widgets = {(): top}
         for key in sorted(nodes):
             cnt, size = nodes[key]
@@ -1177,7 +1431,7 @@ class MainWindow(QMainWindow):
         self.b_cancel.setVisible(busy or scanning)
         self.b_clear.setEnabled(not busy and not scanning)
         for wdg in (self.layout_box, self.raw_box, self.camvid_box, self.othervid_box, self.nodate_box,
-                    *self.includes.values()):
+                    self.tiny_box, *self.includes.values()):
             wdg.setEnabled(not busy)
 
     def closeEvent(self, e):
