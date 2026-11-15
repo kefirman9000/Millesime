@@ -901,6 +901,7 @@ class DestIndex:
         self._con = None
 
     def build(self, progress=lambda n: None, cancel=lambda: False):
+        reconcile_moves(self.root)        # a reorganize that was cut off: records put right first
         self._con = open_db(self.root)
         cached = {r: (s, m, h) for r, s, m, h in self._con.execute("SELECT rel, size, mtime_ns, hash FROM files")}
         n = 0
@@ -1643,6 +1644,656 @@ def clean_folder_path(text: str) -> str:
     """'Photos\\Events/ Wedding ' -> 'Photos/Events/Wedding', each part made safe for Windows."""
     parts = [p for p in re.split(r"[\\/]+", text or "") if p.strip()]
     return "/".join(safe_name(p, "_") for p in parts)
+
+
+# --------------------------------------------------------------------------- #
+# Time left: a steady estimate that doesn't panic while things get going
+# --------------------------------------------------------------------------- #
+PER_FILE_COST = 512 * 1024      # every file costs about this much in opening, saving and naming
+
+
+def copy_cost(it: Item) -> int:
+    """How much work an item is, in bytes. Files backed up before aren't read again, so they're
+    nearly free; everything else is read (and usually written) in full."""
+    return (0 if it.known_dest else it.size) + PER_FILE_COST
+
+
+class Eta:
+    """Time left, worked out from how fast the last minute or so went, not from the first few
+    seconds (when drives spin up and Windows fills its caches) and not from file counts (one 12 GB
+    video is not the same as one 30 KB picture).
+
+    Feed it the time spent working (breaks and pauses left out), the work done and the work in all,
+    in any unit (bytes here). It says nothing (None) until it has watched for WARMUP_S seconds."""
+
+    WARMUP_S = 10.0       # say "working it out" until this much work time has gone by
+    SKIP_S = 3.0          # the very first seconds are ignored when measuring the speed
+    WINDOW_S = 60.0       # speed measured over about this much recent time
+    SMOOTH = 0.25         # how quickly a new measurement moves the estimate (0..1)
+
+    def __init__(self):
+        from collections import deque
+        self._samples: deque = deque()
+        self._t0: float | None = None
+        self._last: tuple[float, float] | None = None    # (time, seconds left) last given
+        self.rate = 0.0                                    # work per second, recently
+
+    def update(self, active_s: float, done: float, total: float) -> float | None:
+        if self._t0 is None:
+            self._t0 = active_s
+        t = active_s - self._t0
+        if t >= self.SKIP_S:
+            self._samples.append((t, done))
+            while len(self._samples) > 2 and self._samples[1][0] < t - self.WINDOW_S:
+                self._samples.popleft()
+        left_work = max(0.0, total - done)
+        if left_work <= 0:
+            return 0.0
+        if t < self.WARMUP_S or len(self._samples) < 2:
+            return None
+        (ta, da), (tb, db) = self._samples[0], self._samples[-1]
+        if tb - ta < 1.0:
+            return self._last[1] if self._last else None
+        rate = (db - da) / (tb - ta)
+        if rate <= 0:
+            # nothing finished in the window (one huge file): count down from the last estimate
+            return self._predicted(t)
+        self.rate = rate
+        raw = left_work / rate
+        guess = self._predicted(t)
+        est = raw if guess is None else guess + self.SMOOTH * (raw - guess)
+        self._last = (t, est)
+        return max(0.0, est)
+
+    def _predicted(self, t: float) -> float | None:
+        if not self._last:
+            return None
+        return max(0.0, self._last[1] - (t - self._last[0]))
+
+
+def format_left(secs: float | None) -> str:
+    """'about 25 min left', rounded so it doesn't flicker."""
+    if secs is None:
+        return "working out the time left…"
+    if secs < 60:
+        return "under a minute left"
+    mins = secs / 60
+    if mins < 10:
+        return f"about {round(mins)} min left"
+    if mins < 60:
+        return f"about {int(5 * round(mins / 5))} min left"
+    h, m = divmod(int(5 * round(mins / 5)), 60)
+    return f"about {h} h {m:02d} min left" if m else f"about {h} h left"
+
+
+# --------------------------------------------------------------------------- #
+# How a library is organized: remembered in its records, or worked out from its folders
+# --------------------------------------------------------------------------- #
+LAYOUT_KEYS = ("layout", "raw_split", "camera_videos", "other_videos", "no_date")
+NO_DATE = {"file_date": "Use the file's date (what the camera saved)", "undated": "Put it in an \"Undated\" folder"}
+_OPTION_LABELS = {"layout": LAYOUTS, "raw_split": RAW_SPLIT, "camera_videos": CAMERA_VIDEOS,
+                  "other_videos": OTHER_VIDEOS, "no_date": NO_DATE}
+_OPTION_NAMES = {"layout": "Photo folders", "raw_split": "RAW / JPEG", "camera_videos": "Camera videos",
+                 "other_videos": "Other videos", "no_date": "No date inside"}
+
+
+def profile_of(settings: dict) -> dict:
+    return {k: settings.get(k, DEFAULT_SETTINGS[k]) for k in LAYOUT_KEYS}
+
+
+def profile_diff(a: dict | None, b: dict | None) -> list[str]:
+    """Options that are set in both and differ."""
+    if not a or not b:
+        return []
+    return [k for k in LAYOUT_KEYS if k in a and k in b and a[k] != b[k]]
+
+
+def describe_option(key: str, value: str) -> str:
+    label = _OPTION_LABELS.get(key, {}).get(value, value)
+    return label.split("   (")[0]
+
+
+def describe_profile(p: dict, keys=None) -> str:
+    return "\n".join(f"{_OPTION_NAMES[k]}: {describe_option(k, p[k])}" for k in (keys or LAYOUT_KEYS) if k in p)
+
+
+def is_library(p: Path) -> bool:
+    m = p / META_NAME
+    return exists(m / DB_NAME) or exists(m / INDEX_NAME)
+
+
+def find_library_near(p: Path) -> tuple[Path, str] | None:
+    """A Millésime library at, above or just below the folder picked: (its folder, 'here' / 'above' /
+    'below'). Picking D:\\Library\\Photos, or D:\\ when the library is D:\\Library, finds D:\\Library."""
+    try:
+        if is_library(p):
+            return p, "here"
+        for parent in list(p.parents)[:6]:
+            if is_library(parent):
+                return parent, "above"
+        found = [c for c in os.scandir(L(p)) if c.is_dir() and not c.name.startswith(".") and is_library(Path(c.path))]
+        if len(found) == 1:
+            return Path(found[0].path.removeprefix("\\\\?\\")), "below"
+    except OSError:
+        pass
+    return None
+
+
+def read_profile(lib: Path) -> dict | None:
+    """The sort options this library was last filled with (None for libraries from before 1.9)."""
+    try:
+        con = open_db(lib)
+        row = con.execute("SELECT value FROM meta WHERE key='profile'").fetchone()
+        con.close()
+        if row:
+            p = json.loads(row[0])
+            return {k: p[k] for k in LAYOUT_KEYS if k in p}
+    except Exception as e:
+        log_error("Reading how the library is organized", e)
+    return None
+
+
+def save_profile(lib: Path, settings_or_profile: dict) -> None:
+    try:
+        con = open_db(lib)
+        with con:
+            con.execute("INSERT OR REPLACE INTO meta VALUES ('profile', ?)",
+                        (json.dumps(profile_of(settings_or_profile)),))
+        con.close()
+    except Exception as e:
+        log_error("Saving how the library is organized", e)
+
+
+_YEAR_RE = re.compile(r"^(19[0-9]{2}|20[0-9]{2})$")
+_MONTH_RE = re.compile(r"^(0[1-9]|1[0-2]) - ([A-Za-z]+)$")
+MEDIA_KINDS = {"raw", "photo", "video"}
+
+
+def parse_place(folder: str) -> dict | None:
+    """Recognize a folder Millésime made, in any of its layouts:
+    'Photos/2019/07 - July/2019-07-04/RAW' -> {top: Photos, layout: year_month_day, y: 2019, m: 7, d: 4,
+    sub: RAW}. None for folders it didn't make (Photos/Events/Wedding)."""
+    parts = folder.split("/") if folder else []
+    if not parts or parts[0] not in (LIB["photo"], LIB["video"]):
+        return None
+    top, rest = parts[0], parts[1:]
+    out = {"top": top, "layout": None, "y": None, "m": None, "d": None, "sub": "", "undated": False, "flat": False}
+    if top == LIB["video"] and not rest:
+        out["flat"] = True
+        return out
+    if not rest:
+        return None
+    i = 1
+    if rest[0] == UNDATED:
+        out["undated"] = True
+    elif _YEAR_RE.match(rest[0]):
+        y = int(rest[0])
+        out["y"], out["layout"] = y, "year"
+        if len(rest) > 1:
+            mm = _MONTH_RE.match(rest[1])
+            if mm and MONTHS[int(mm.group(1)) - 1] == mm.group(2):
+                out["m"], out["layout"], i = int(mm.group(1)), "year_month", 2
+                if len(rest) > 2:
+                    md = re.match(rf"^{y}-{mm.group(1)}-(0[1-9]|[12]\d|3[01])$", rest[2])
+                    if md:
+                        out["d"], out["layout"], i = int(md.group(1)), "year_month_day", 3
+            else:
+                mn = re.match(rf"^{y}-(0[1-9]|1[0-2])$", rest[1])
+                if mn:
+                    out["m"], out["layout"], i = int(mn.group(1)), "year_monthname", 2
+    else:
+        return None
+    sub = rest[i:]
+    if len(sub) > 1:
+        return None
+    if sub:
+        allowed = {"RAW", "JPEG", "Videos"} if top == LIB["photo"] else set()
+        if sub[0] not in allowed:
+            return None
+        out["sub"] = sub[0]
+    return out
+
+
+def _unalias(rel: str, aliases: dict | None) -> tuple[str, str]:
+    """The folder Millésime would call this (before the user renamed it), and the renamed folder's
+    original name if it's inside one."""
+    if not aliases:
+        return rel, ""
+    hit = ""
+    for _ in range(10):
+        best_k, best_v = "", ""
+        for k, v in aliases.items():
+            if v != k and (rel == v or rel.startswith(v + "/")) and len(v) > len(best_v):
+                best_k, best_v = k, v
+        if not best_v:
+            break
+        rel = best_k + rel[len(best_v):]
+        hit = hit or best_k
+    return rel, hit
+
+
+def _split(rel: str) -> tuple[str, str]:
+    folder, _, name = rel.rpartition("/")
+    return folder, name
+
+
+def detect_layout(lib: Path, aliases: dict | None = None, limit: int = 50000, cancel=lambda: False) -> dict:
+    """Work out the sort options a library was filled with by looking at its folders. Returns
+    {"profile": {only the options there was evidence for}, "recognized": n, "custom": n}."""
+    votes: dict[str, dict[str, int]] = {k: {} for k in LAYOUT_KEYS}
+
+    def vote(k, v, n=1):
+        votes[k][v] = votes[k].get(v, 0) + n
+
+    recognized = custom = 0
+    for top in (LIB["photo"], LIB["video"]):
+        root = lib / top
+        if not exists(root):
+            continue
+        for rel, _size, _m in walk_files(root, cancel):
+            name = rel.rpartition("/")[2]
+            kind = kind_of(os.path.splitext(name)[1].lower())
+            if kind not in MEDIA_KINDS:
+                continue
+            generic, _ = _unalias(f"{top}/{rel}", aliases)
+            place = parse_place(_split(generic)[0])
+            if not place:
+                custom += 1
+                continue
+            recognized += 1
+            if place["layout"]:
+                vote("layout", place["layout"])
+            if place["undated"]:
+                vote("no_date", "undated")
+            if place["top"] == LIB["photo"]:
+                if kind == "video":
+                    vote("camera_videos", "photos_sub" if place["sub"] == "Videos" else "photos_mixed")
+                elif kind == "raw":
+                    vote("raw_split", "raw_in_sub" if place["sub"] == "RAW" else "together")
+                elif place["sub"] == "JPEG":
+                    vote("raw_split", "split")
+                # a JPEG loose in the month folder fits both "together" and "RAW folder inside"
+            elif kind == "video":
+                if place["flat"]:
+                    vote("other_videos", "flat")
+                elif CAMERA_NAME_RE.match(name):
+                    vote("camera_videos", "videos")
+                else:
+                    vote("other_videos", "by_date")
+            if recognized + custom >= limit:
+                break
+    rs = votes.pop("raw_split")
+    prof = {}
+    for k, vs in votes.items():
+        if vs:
+            prof[k] = max(vs.items(), key=lambda kv: kv[1])[0]
+    if rs.get("split"):
+        prof["raw_split"] = "split"
+    elif rs.get("raw_in_sub", 0) > rs.get("together", 0):
+        prof["raw_split"] = "raw_sub"
+    elif rs:
+        prof["raw_split"] = "together"
+    return {"profile": prof, "recognized": recognized, "custom": custom}
+
+
+# --------------------------------------------------------------------------- #
+# Reorganizing a library: moving what's there into a different layout, on the same drive
+# --------------------------------------------------------------------------- #
+MOVING_NAME = "moving.csv"     # what's being moved right now (so a crash can be put right)
+_OS_JUNK = {"thumbs.db", ".ds_store"}   # regenerated by Windows / macOS; never stop a folder being tidied away
+
+
+def _date_fits(place: dict, dt: datetime | None) -> bool:
+    if place["undated"] or place["flat"]:
+        return True
+    if dt is None:
+        return False
+    return (dt.year == place["y"] and (place["m"] is None or dt.month == place["m"])
+            and (place["d"] is None or dt.day == place["d"]))
+
+
+def _attach_sidecars(names: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+    """Main files in a folder, and the sidecars that travel with each (IMG_1.xmp / IMG_1.CR2.xmp)."""
+    mains = [n for n in names if os.path.splitext(n)[1].lower() not in SIDECAR_EXT]
+    cars = [n for n in names if os.path.splitext(n)[1].lower() in SIDECAR_EXT]
+    by_name = {n.lower(): n for n in mains}
+    by_stem: dict[str, list[str]] = {}
+    for n in mains:
+        by_stem.setdefault(os.path.splitext(n)[0].lower(), []).append(n)
+    out: dict[str, list[str]] = {}
+    for c in cars:
+        key = os.path.splitext(c)[0].lower()
+        owner = by_name.get(key)
+        if not owner:
+            cands = by_stem.get(key, [])
+            raws = [n for n in cands if os.path.splitext(n)[1].lower() in RAW_EXT]
+            owner = (raws or cands or [None])[0]
+        if owner:
+            out.setdefault(owner, []).append(c)
+    return mains, out
+
+
+def _numbered_name(taken: set[str], folder: str, name: str, cars: list[str]) -> str:
+    """name, or name_1, name_2 … so that it and its sidecars are all free in the folder."""
+    stem, ext = os.path.splitext(name)
+    n = 0
+    while True:
+        new_stem = stem if n == 0 else f"{stem}_{n}"
+        names = [new_stem + ext] + [_sidecar_name(Path(c), stem, ext, new_stem) for c in cars]
+        if all(_join(folder, x).lower() not in taken for x in names):
+            return new_stem + ext
+        n += 1
+
+
+def plan_reorganize(lib: Path, settings: dict, aliases: dict | None = None,
+                    progress=lambda done, total, what: None, cancel=lambda: False) -> dict:
+    """Work out where every photo and video already in the library would go with these options.
+    Nothing is moved. Only files in folders Millésime made are moved; folders made or renamed by
+    hand, and files whose date doesn't match their folder, stay where they are."""
+    reconcile_moves(lib)
+    index = DestIndex(lib)
+    index.build(lambda n: progress(0, 0, f"Looking through the library… {n:,} files"), cancel)
+    index.close()
+    con = open_db(lib)
+    known = {d: (t, s) for d, t, s in con.execute(
+        "SELECT dest, taken, date_source FROM card_files WHERE dest != '' AND taken != ''")}
+    con.close()
+    by_folder: dict[str, list[str]] = {}
+    for rel in index.info:
+        folder, name = _split(rel)
+        generic, _ = _unalias(folder, aliases)
+        if generic.split("/")[0] in (LIB["photo"], LIB["video"]):
+            by_folder.setdefault(folder, []).append(name)
+    total = sum(len(v) for v in by_folder.values())
+    taken = set(index.taken)
+    moves: list[dict] = []
+    stats = {"unchanged": 0, "custom": 0, "renamed": 0, "mismatch": 0, "renumbered": 0, "read": 0}
+    done = 0
+    last_said = 0.0
+    for folder, names in sorted(by_folder.items()):
+        if time.monotonic() - last_said > 0.3:
+            last_said = time.monotonic()
+            progress(done, total, f"Working out where everything goes… {folder.replace('/', ' › ')}")
+        mains, cars_of = _attach_sidecars(names)
+        generic, alias_key = _unalias(folder, aliases)
+        place = parse_place(generic)
+        for name in sorted(mains):
+            if cancel():
+                raise Cancelled()
+            done += 1 + len(cars_of.get(name, []))
+            kind = kind_of(os.path.splitext(name)[1].lower())
+            if kind not in MEDIA_KINDS or is_temp_name(name) or name.endswith(".damaged-copy"):
+                continue
+            if not place:
+                stats["custom"] += 1
+                continue
+            rel = _join(folder, name)
+            rec = known.get(rel)
+            dt, src = None, ""
+            if rec:
+                try:
+                    dt, src = datetime.fromisoformat(rec[0]), rec[1] or ""
+                except ValueError:
+                    rec = None
+            if not rec:
+                if time.monotonic() - last_said > 0.3:
+                    last_said = time.monotonic()
+                    progress(done, total, f"Reading the date inside {name}")
+                dt, src = taken_date(lib / rel, True)
+                stats["read"] += 1
+            if not _date_fits(place, dt):
+                stats["mismatch"] += 1
+                continue
+            if settings.get("no_date") == "undated" and src == "file date":
+                dt = None
+            camera = kind == "video" and (place["top"] == LIB["photo"] or bool(CAMERA_NAME_RE.match(name)))
+            it = Item(src=Path(name), size=index.info[rel][0], kind=kind, camera=camera, taken=dt)
+            plan([it], settings, {}, None)
+            new_generic = it.folder
+            if new_generic == generic:
+                stats["unchanged"] += 1
+                continue
+            if alias_key and not (new_generic == alias_key or new_generic.startswith(alias_key + "/")):
+                stats["renamed"] += 1      # inside a folder the user named: leave it there
+                continue
+            new_folder = apply_aliases(new_generic, aliases)
+            if new_folder == folder:
+                stats["unchanged"] += 1
+                continue
+            cars = cars_of.get(name, [])
+            new_name = _numbered_name(taken, new_folder, name, cars)
+            if new_name != name:
+                stats["renumbered"] += 1
+            stem, ext = os.path.splitext(name)
+            new_stem = os.path.splitext(new_name)[0]
+            pairs = [(rel, _join(new_folder, new_name))]
+            pairs += [(_join(folder, c), _join(new_folder, _sidecar_name(Path(c), stem, ext, new_stem))) for c in cars]
+            for _a, b in pairs:
+                taken.add(b.lower())
+            moves.append({"pairs": pairs, "size": it.size})
+    progress(total, total, "")
+    return {"moves": moves, "files": total, "settings": profile_of(settings), **stats}
+
+
+def _move_no_overwrite(src: Path, dst: Path) -> None:
+    """Move within the library drive. Never replaces anything that's there."""
+    os.makedirs(L(dst.parent), exist_ok=True)
+    if os.name == "nt":
+        os.rename(L(src), L(dst))         # raises FileExistsError instead of overwriting
+        return
+    if os.path.lexists(dst):
+        raise FileExistsError(str(dst))
+    try:
+        os.link(src, dst)                 # fails if dst appeared meanwhile
+        os.unlink(src)
+    except FileExistsError:
+        raise
+    except OSError:                        # exFAT and others have no hard links
+        if os.path.lexists(dst):
+            raise FileExistsError(str(dst))
+        os.rename(src, dst)
+
+
+def _db_moved(con, pairs: list[tuple[str, str]]) -> None:
+    """Keep the checksums and the card records with files that moved."""
+    with con:
+        for a, b in pairs:
+            con.execute("DELETE FROM files WHERE rel=? AND EXISTS (SELECT 1 FROM files WHERE rel=?)", (b, a))
+            con.execute("UPDATE files SET rel=? WHERE rel=?", (b, a))
+            con.execute("UPDATE card_files SET dest=? WHERE dest=?", (b, a))
+
+
+def _meta_get(con, key: str) -> str | None:
+    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _meta_set(con, key: str, value: str | None) -> None:
+    with con:
+        if value is None:
+            con.execute("DELETE FROM meta WHERE key=?", (key,))
+        else:
+            con.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, value))
+
+
+def reconcile_moves(lib: Path) -> int:
+    """If a reorganize was cut off (crash, power cut, drive pulled), bring the records in line with
+    what actually moved. Safe to run any number of times. Returns how many records were fixed."""
+    j = lib / META_NAME / MOVING_NAME
+    if not exists(j):
+        return 0
+    fixed = []
+    try:
+        with open(L(j), newline="", encoding="utf-8") as f:
+            rows = [r for r in csv.reader(f) if len(r) >= 3 and r[0] in ("move", "undo")]
+        for _op, a, b in (r[:3] for r in rows):
+            if exists(lib / b) and not exists(lib / a):
+                fixed.append((a, b))
+        con = open_db(lib)
+        _db_moved(con, fixed)
+        logs = lib / META_NAME / LOGS_NAME
+        os.makedirs(L(logs), exist_ok=True)
+        undo = bool(rows) and rows[0][0] == "undo"
+        name = f"{datetime.now():%Y-%m-%d_%H%M%S}_{'undo' if undo else 'reorganize'}-interrupted.csv"
+        os.replace(L(j), L(logs / name))
+        if rows and not undo:
+            # a cut-off reorganize can still be undone; a cut-off undo can simply be run again
+            _meta_set(con, "last_reorganize", name)
+        con.close()
+    except Exception as e:
+        log_error("Finishing an interrupted reorganize", e)
+    return len(fixed)
+
+
+def _remove_empty_dirs(lib: Path, folders: set[str]) -> int:
+    """Remove folders left empty by moving (and their empty parents). Never removes a file other
+    than Thumbs.db / .DS_Store, which Windows and macOS make again on their own."""
+    gone = 0
+    todo = set()
+    for f in folders:
+        parts = f.split("/")
+        for i in range(len(parts), 1, -1):          # never the top folders (Photos, Videos)
+            todo.add("/".join(parts[:i]))
+    for f in sorted(todo, key=lambda x: -x.count("/")):
+        p = lib / f
+        try:
+            left = os.listdir(L(p))
+            if left and all(x.lower() in _OS_JUNK for x in left):
+                for x in left:
+                    os.unlink(L(p / x))
+                left = []
+            if not left:
+                os.rmdir(L(p))
+                gone += 1
+        except OSError:
+            pass
+    return gone
+
+
+def _run_moves(lib: Path, pairs_list: list[list[tuple[str, str]]], op: str, progress, cancel) -> dict:
+    """Move groups of files (a photo and its sidecars move together), writing each move down first."""
+    meta = lib / META_NAME
+    os.makedirs(L(meta), exist_ok=True)
+    j = open(L(meta / MOVING_NAME), "a", newline="", encoding="utf-8")
+    w = csv.writer(j)
+    con = open_db(lib)
+    batch: list[tuple[str, str]] = []
+    moved = skipped = 0
+    problems: list[str] = []
+    left_folders: set[str] = set()
+    total = len(pairs_list)
+    try:
+        for i, pairs in enumerate(pairs_list):
+            if cancel():
+                break
+            if i % 25 == 0:
+                progress(i, total, pairs[0][0])
+            if not exists(lib):
+                raise DriveGone("The library drive was disconnected.")
+            main_a, main_b = pairs[0]
+            if not exists(lib / main_a):
+                skipped += 1
+                problems.append(f"{main_a}: no longer there")
+                continue
+            if any(exists(lib / b) for _a, b in pairs):
+                skipped += 1
+                problems.append(f"{main_a}: something is already at {main_b}")
+                continue
+            for a, b in pairs:
+                if not exists(lib / a):
+                    continue
+                w.writerow([op, a, b])
+                j.flush()
+                try:
+                    _move_no_overwrite(lib / a, lib / b)
+                except OSError as e:
+                    problems.append(f"{a}: {e}")
+                    continue
+                batch.append((a, b))
+                left_folders.add(_split(a)[0])
+            moved += 1
+            if len(batch) >= 200:
+                os.fsync(j.fileno())
+                _db_moved(con, batch)
+                batch = []
+        _db_moved(con, batch)
+    finally:
+        j.close()
+        con.close()
+    progress(total, total, "")
+    return {"moved": moved, "skipped": skipped, "problems": problems, "left": left_folders,
+            "cancelled": bool(cancel()) and moved < total}
+
+
+def run_reorganize(lib: Path, the_plan: dict, before: dict | None = None,
+                   progress=lambda done, total, what: None, cancel=lambda: False) -> dict:
+    """Carry out a plan from plan_reorganize. Moves stay on the same drive: nothing is copied,
+    deleted or overwritten. A record of every move is kept so it can be undone."""
+    reconcile_moves(lib)
+    res = _run_moves(lib, [m["pairs"] for m in the_plan["moves"]], "move", progress, cancel)
+    res["folders_removed"] = _remove_empty_dirs(lib, res["left"])
+    logs = lib / META_NAME / LOGS_NAME
+    os.makedirs(L(logs), exist_ok=True)
+    name = f"{datetime.now():%Y-%m-%d_%H%M%S}_reorganize.csv"
+    con = open_db(lib)
+    try:
+        j = lib / META_NAME / MOVING_NAME
+        if exists(j) and res["moved"]:
+            os.replace(L(j), L(logs / name))
+            _meta_set(con, "last_reorganize", name)
+            _meta_set(con, "profile_before", json.dumps(before) if before else None)
+            res["record"] = logs / name
+        elif exists(j):
+            os.unlink(L(j))                 # nothing moved: nothing to keep
+        if not res["cancelled"]:
+            _meta_set(con, "profile", json.dumps(the_plan["settings"]))
+    finally:
+        con.close()
+    backup_db(lib)
+    return res
+
+
+def last_reorganize(lib: Path) -> tuple[Path, dict | None] | None:
+    """The record of the last reorganize that can still be undone, and the options from before it."""
+    try:
+        con = open_db(lib)
+        name, before = _meta_get(con, "last_reorganize"), _meta_get(con, "profile_before")
+        con.close()
+        p = lib / META_NAME / LOGS_NAME / name if name else None
+        if p and exists(p):
+            return p, (json.loads(before) if before else None)
+    except Exception as e:
+        log_error("Looking for the last reorganize", e)
+    return None
+
+
+def undo_reorganize(lib: Path, progress=lambda done, total, what: None, cancel=lambda: False) -> dict:
+    """Put every file the last reorganize moved back where it was (and its old name), as long as
+    nothing else has taken that place since."""
+    reconcile_moves(lib)
+    last = last_reorganize(lib)
+    if not last:
+        return {"moved": 0, "skipped": 0, "problems": ["Nothing to undo."], "left": set(), "cancelled": False}
+    record, before = last
+    with open(L(record), newline="", encoding="utf-8") as f:
+        rows = [r for r in csv.reader(f) if len(r) >= 3 and r[0] == "move"]
+    groups = [[(b, a)] for _op, a, b in reversed([r[:3] for r in rows])]
+    res = _run_moves(lib, groups, "undo", progress, cancel)
+    res["folders_removed"] = _remove_empty_dirs(lib, res["left"])
+    logs = lib / META_NAME / LOGS_NAME
+    con = open_db(lib)
+    try:
+        if exists(lib / META_NAME / MOVING_NAME):
+            os.replace(L(lib / META_NAME / MOVING_NAME), L(logs / f"{datetime.now():%Y-%m-%d_%H%M%S}_undo.csv"))
+        if not res["cancelled"]:
+            _meta_set(con, "last_reorganize", None)
+            if before:
+                _meta_set(con, "profile", json.dumps(before))
+    finally:
+        con.close()
+    res["before"] = before
+    backup_db(lib)
+    return res
 
 
 # --------------------------------------------------------------------------- #
