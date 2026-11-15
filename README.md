@@ -105,6 +105,36 @@ WMA, WAV and more), so an album with guest artists stays in one folder. Songs wi
 together under `Unknown Artist` and the name of the folder they came from. `cover.jpg`,
 `folder.jpg` and similar pictures next to songs go with the album, not into Photos.
 
+## Changing your mind: reorganize the library
+
+Decided you want **Year › Month › Day** after all, or RAW files in their own folder? Change the
+options at the top, then **Tools › Reorganize the library to match these options…**. It shows
+exactly what would move first (**Show Details** lists every file), then moves the photos and videos
+already in the library into the new folders.
+
+- **Moves stay on the same drive**, so it's quick: nothing is copied, deleted or overwritten. A file
+  that would land on a different file with the same name gets a number (`IMG_0001_1.CR2`).
+- **Sidecars move with their photo**, and the library's records (checksums, which cards were backed
+  up) follow, so health checks and repeat backups keep working.
+- **Your own folders are left alone:** folders you made yourself (`Photos\Events\Wedding`), folders
+  you renamed (`2019-07-04 Smith Wedding`), and files whose date doesn't match their folder (moved
+  there by hand) stay where they are.
+- Folders left empty are tidied away.
+- **Tools › Undo the last reorganize** puts every file back where it was, with its old name.
+- If it's interrupted (crash, power cut, drive pulled out), every file is either moved or not, and
+  the records are put right the next time the library is opened.
+
+## Libraries it already knows
+
+Millésime remembers how each library is organized. When you choose a library folder (or press
+**Start copying**) and the options don't match how the files there are organized, it says so and
+offers to **use the library's way**, **reorganize the library** to the new options, or copy anyway.
+A strip under the options says the same while they differ.
+
+Libraries made by older versions are recognized from their folders (`Photos\2019\07 - July\RAW` and
+so on). If you pick a folder inside a library (`D:\Library\Photos`) or the drive it's on (`D:\`), it
+offers to use the library itself. **Tools › How is this library organized?** shows what it found.
+
 ## The safety rules
 
 - **Your cards and old drives are only read.** Nothing on them is moved, renamed, deleted or written.
@@ -170,6 +200,10 @@ recording date of MP4/MOV videos. Rows that fell back to the file's own date are
 
 ## Reliability and big jobs
 
+- **A time-left estimate you can trust.** It's worked out by size (one 12 GB video isn't the same
+  as one small picture) from how fast the last minute went, leaving out checking the library,
+  breaks and pauses. For the first 10 seconds, while the drives get going, it says "working out the
+  time left…" rather than guessing.
 - **Progress inside big files.** The status line shows how far through a big file it is
   (`Copying MVI_0042.MOV · 3.1 GB of 12.4 GB`, then `Checking the copy of …`), so a long video never
   looks stuck.

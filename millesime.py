@@ -136,7 +136,7 @@ class ScanWorker(QThread):
 
 
 class CopyWorker(QThread):
-    progress = Signal(int, int, object)      # done, total, bytes done
+    progress = Signal(object)                # {"phase", "done", "total", "work_done", "work_total", "active_s", "read_bytes"}
     status = Signal(str)
     row_done = Signal(int)
     file_progress = Signal(str)              # inside a big file: "MVI_0042.MOV · 3.1 of 12.4 GB"
@@ -147,6 +147,11 @@ class CopyWorker(QThread):
         super().__init__()
         self.items, self.dest = items, dest
         self.queue: deque[int] = deque(rows)   # files dropped while copying are added here
+        import threading
+        self._qlock = threading.Lock()
+        self.work_left = sum(engine.copy_cost(items[r]) for r in rows)   # for the time-left estimate
+        self._work_t0: float | None = None     # when the first file started (not the library check)
+        self._paused_s = 0.0
         self.more_coming = more_coming
         self.settings = settings               # the window's settings: changes apply while copying
         self.stop = False
@@ -194,13 +199,28 @@ class CopyWorker(QThread):
         self.activity = before
         self._worked_since = self._tick = time.monotonic()
 
+    def enqueue(self, rows):
+        """Files dropped while copying join the queue (called from the window)."""
+        with self._qlock:
+            self.work_left += sum(engine.copy_cost(self.items[r]) for r in rows)
+            self.queue.extend(rows)
+
+    def active_s(self) -> float:
+        """Time spent actually copying: the library check, breaks and pauses left out."""
+        if self._work_t0 is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._work_t0 - self._paused_s - self.stats["break_s"])
+
     def cancel(self) -> bool:
         """Called for every piece of every file: where Pause, breaks and Stop take effect."""
         self._tick = self.last_activity = time.monotonic()
-        while self.paused and not self.stop:
-            time.sleep(0.2)
-            self._tick = self.last_activity = time.monotonic()
-            self._worked_since = time.monotonic()
+        if self.paused and not self.stop:
+            t0 = time.monotonic()
+            while self.paused and not self.stop:
+                time.sleep(0.2)
+                self._tick = self.last_activity = time.monotonic()
+                self._worked_since = time.monotonic()
+            self._paused_s += time.monotonic() - t0
         every = max(1, int(self.settings.get("break_every_min", 10))) * 60
         if self.gentle and not self.stop and time.monotonic() - self._worked_since > every:
             self._take_break()
@@ -254,7 +274,8 @@ class CopyWorker(QThread):
             log = engine.LogWriter(self.dest, started)
             self.log_path = log.path
             store = engine.CardStore(self.dest)
-            done, done_bytes = 0, 0
+            done, done_bytes, work_done, read_bytes = 0, 0, 0, 0
+            self._work_t0 = time.monotonic()
             while True:
                 if self.cancel():
                     self.cancelled = True
@@ -266,8 +287,11 @@ class CopyWorker(QThread):
                         time.sleep(0.2)
                         continue
                     break
-                r = self.queue.popleft()
-                it = self.items[r]
+                with self._qlock:
+                    r = self.queue.popleft()
+                    it = self.items[r]
+                    cost = engine.copy_cost(it)
+                    self.work_left -= cost
                 if it.status != "Waiting":
                     continue
                 drive = str(engine.volume_root(it.src))
@@ -348,13 +372,20 @@ class CopyWorker(QThread):
                     store.record(it, engine.source_key(it.src)[1] if it.source_id else "")
                     done += 1
                     done_bytes += it.size
+                    work_done += cost
+                    if not (it.status == "Duplicate" and it.known_dest):
+                        read_bytes += it.size
                     self.stats["bytes"] = done_bytes
-                    self.progress.emit(done, done + len(self.queue), done_bytes)
+                    self.progress.emit({"phase": "copy", "done": done, "total": done + len(self.queue),
+                                        "work_done": work_done, "work_total": work_done + max(0, self.work_left),
+                                        "active_s": self.active_s(), "read_bytes": read_bytes})
                 self.row_done.emit(r)
                 if stop_run:
                     break
                 if done and done % 200 == 0:
                     index.save(drop_missing=False)
+            if copied_rows:
+                engine.save_profile(self.dest, self.settings)    # how this library is organized now
             if copied_rows and not self.stop and not self.error and self.settings.get("final_check", True):
                 self._final_check(copied_rows, index, log)
         except engine.Cancelled:
@@ -384,13 +415,18 @@ class CopyWorker(QThread):
     def _final_check(self, rows, index, log):
         """Re-read every file copied in this run straight from the drive (not from memory) and compare."""
         total = len(rows)
+        work_total = sum(self.items[r].size + engine.PER_FILE_COST for r in rows)
+        work_done = checked_bytes = 0
         for k, r in enumerate(rows):
             if self.cancel():
                 return
             it = self.items[r]
             self._touch(f"Final check of {it.dest}")
             self.status.emit(f"Final check: re-reading this run's copies from the drive itself… {k + 1:,} of {total:,}")
-            self.progress.emit(k, total, 0)
+            self.progress.emit({"phase": "check", "done": k, "total": total, "work_done": work_done,
+                                "work_total": work_total, "active_s": self.active_s(), "read_bytes": checked_bytes})
+            work_done += it.size + engine.PER_FILE_COST
+            checked_bytes += it.size
             p = self.dest / it.dest
             try:
                 want = index.info.get(it.dest, [0, 0, ""])[2]
@@ -416,7 +452,8 @@ class CopyWorker(QThread):
                            "Press Start copying to copy it again, and run a health check on the drive.")
                 log.write(it)
                 self.row_done.emit(r)
-        self.progress.emit(total, total, 0)
+        self.progress.emit({"phase": "check", "done": total, "total": total, "work_done": work_total,
+                            "work_total": work_total, "active_s": self.active_s(), "read_bytes": checked_bytes})
 
     def _write_report(self, started):
         st = self.stats
@@ -479,6 +516,57 @@ class HealthWorker(QThread):
         finally:
             engine.keep_awake(False)
             engine.low_priority(False)
+
+
+class ReorgWorker(QThread):
+    """Works out (job 'plan'), carries out ('run') or undoes ('undo') a reorganize of the library."""
+    progress = Signal(int, int, str)
+
+    def __init__(self, lib, job, settings=None, aliases=None, the_plan=None, before=None):
+        super().__init__()
+        self.lib, self.job, self.settings, self.aliases = lib, job, dict(settings or {}), dict(aliases or {})
+        self.the_plan, self.before = the_plan, before
+        self.stop, self.result, self.error, self.cancelled = False, {}, "", False
+
+    def run(self):
+        engine.keep_awake(True)
+        cancel = lambda: self.stop
+        try:
+            if self.job == "plan":
+                self.result = engine.plan_reorganize(self.lib, self.settings, self.aliases, self.progress.emit, cancel)
+            elif self.job == "run":
+                self.result = engine.run_reorganize(self.lib, self.the_plan, self.before, self.progress.emit, cancel)
+            else:
+                self.result = engine.undo_reorganize(self.lib, self.progress.emit, cancel)
+            self.cancelled = bool(self.result.get("cancelled"))
+        except engine.Cancelled:
+            self.cancelled = True
+        except Exception as e:
+            engine.log_error(f"Reorganizing the library ({self.job})", e)
+            self.error = str(e)
+        finally:
+            engine.keep_awake(False)
+
+
+class DetectWorker(QThread):
+    """Reads how a library is organized: from its records, or by looking at its folders."""
+    def __init__(self, lib, aliases):
+        super().__init__()
+        self.lib, self.aliases = lib, dict(aliases or {})
+        self.profile, self.source, self.detail = None, "", {}
+
+    def run(self):
+        try:
+            self.profile = engine.read_profile(self.lib)
+            if self.profile:
+                self.source = "saved"
+                return
+            d = engine.detect_layout(self.lib, self.aliases)
+            self.detail = d
+            if d["recognized"] and d["profile"]:
+                self.profile, self.source = d["profile"], "detected"
+        except Exception as e:
+            engine.log_error("Working out how the library is organized", e)
 
 
 class UpdateCheckWorker(QThread):
@@ -711,10 +799,14 @@ class MainWindow(QMainWindow):
         self.lock: QLockFile | None = None
         self._stall_logged = 0.0
         self.source_lines: list[str] = []
-        self._paused_at = 0.0
         self._upd_check = None
         self._upd_apply = None
-        self._copy_t0 = 0.0
+        self._eta_phase, self._eta = "", None
+        self.reorg: ReorgWorker | None = None
+        self.detector: DetectWorker | None = None
+        self.lib_profile: dict | None = None      # how the library on the drive is organized
+        self.lib_profile_source = ""              # "saved" or "detected"
+        self._layout_ok: dict | None = None       # options the user said are fine to mix in, this session
         self.setWindowTitle(f"{APP_NAME} — sort cards and old drives onto a new drive")
         if ICON_FILE.exists():
             self.setWindowIcon(QIcon(str(ICON_FILE)))
@@ -820,6 +912,13 @@ class MainWindow(QMainWindow):
         g.setColumnStretch(3, 1)
         v.addWidget(box)
 
+        self.layout_note = QLabel()
+        self.layout_note.setWordWrap(True)
+        self.layout_note.setStyleSheet("background: rgba(230,160,40,0.16); border-radius: 6px; padding: 6px;")
+        self.layout_note.linkActivated.connect(self._layout_link)
+        self.layout_note.hide()
+        v.addWidget(self.layout_note)
+
         self.cards_label = QLabel()
         self.cards_label.setWordWrap(True)
         self.cards_label.setStyleSheet("background: rgba(43,123,214,0.12); border-radius: 6px; padding: 6px;")
@@ -904,6 +1003,7 @@ class MainWindow(QMainWindow):
         self._show_example()
         self._update_buttons()
         self._rebuild_tree()
+        QTimer.singleShot(300, self._load_library_profile)
         self._restore_layout()
         self._watchdog = QTimer(self)
         self._watchdog.setInterval(30000)
@@ -961,6 +1061,16 @@ class MainWindow(QMainWindow):
         m.addAction(a)
         a = QAction("Forget renamed folders…", self)
         a.triggered.connect(self._reset_aliases)
+        m.addAction(a)
+        m.addSeparator()
+        a = QAction("Reorganize the library to match these options…", self)
+        a.triggered.connect(self.reorganize)
+        m.addAction(a)
+        a = QAction("Undo the last reorganize…", self)
+        a.triggered.connect(self.undo_reorganize)
+        m.addAction(a)
+        a = QAction("How is this library organized?", self)
+        a.triggered.connect(lambda: self._load_library_profile(announce="menu"))
         m.addAction(a)
 
         m = self.menuBar().addMenu("&Help")
@@ -1022,17 +1132,32 @@ class MainWindow(QMainWindow):
         return Path(d) if d else None
 
     def choose_dest(self):
-        if self.copier:
+        if self.copier or self.reorg:
             return
         start = str(self.dest() or Path.home())
         d = QFileDialog.getExistingDirectory(self, "Choose (or make) the library folder on the new drive", start)
         if d:
+            near = engine.find_library_near(Path(d))
+            if near and near[1] != "here":
+                where = ("The folder you picked is inside" if near[1] == "above" else "The folder you picked holds")
+                ans = QMessageBox.question(
+                    self, "Existing library found",
+                    f"{where} a Millésime library:\n\n{near[0]}\n\nUse that library? Its records (what's already "
+                    "there, which cards were backed up) are kept with it, so pointing at the library itself lets "
+                    "Millésime skip duplicates and recognize your cards.",
+                    QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+                if ans == QMessageBox.Cancel:
+                    return
+                if ans == QMessageBox.Yes:
+                    d = str(near[0])
             self.settings["destination"] = d
             engine.save_settings(self.settings)
             self.aliases = engine.load_aliases(Path(d))
             self._replan()
             self._show_dest()
             self._show_example()
+            self._layout_ok = None
+            self._load_library_profile(announce=True)
 
     def _show_dest(self):
         d = self.dest()
@@ -1073,6 +1198,7 @@ class MainWindow(QMainWindow):
                                 "to use them for these files.")
         self._show_example()
         self._replan()
+        self._show_layout_note()
 
     def _sync_only(self):
         """Include boxes don't apply while copying only RAW / chosen types."""
@@ -1141,7 +1267,7 @@ class MainWindow(QMainWindow):
     def _found(self, batch):
         rows = self.model.add(batch)
         if self.copier and rows:
-            self.copier.queue.extend(rows)      # joins the copy that's already running
+            self.copier.enqueue(rows)           # joins the copy that's already running
         self._update_summary()
 
     def _sources_seen(self, summaries):
@@ -1232,7 +1358,7 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- copying
     def start(self):
-        if self.copier or self.healer:
+        if self.copier or self.healer or self.reorg:
             return
         dest = self.dest()
         if not dest or not dest.exists():
@@ -1242,6 +1368,8 @@ class MainWindow(QMainWindow):
         rows = [r for r, it in enumerate(self.model.items) if it.status in ("Waiting", "Error")]
         if not rows and not self.scanners:
             self.status.setText("Nothing waiting to copy.")
+            return
+        if not self._layout_check():
             return
         if not self._preflight(dest, rows):
             return
@@ -1274,7 +1402,7 @@ class MainWindow(QMainWindow):
         self.bar.setValue(0)
         self.bar.setFormat("Starting…")
         self.bar.show()
-        self._copy_t0 = time.monotonic()
+        self._eta_phase, self._eta = "", None
         self._update_buttons()
         c.start()
 
@@ -1283,16 +1411,20 @@ class MainWindow(QMainWindow):
         self.table.scrollTo(self.model.index(r, 0))
         self._update_summary()
 
-    def _progress(self, done, total, done_bytes):
-        self.bar.setRange(0, max(1, total))
-        self.bar.setValue(done)
-        secs = max(0.1, time.monotonic() - self._copy_t0)
-        rate = done_bytes / secs
-        left = ""
-        if done and done < total:
-            remain = (total - done) * secs / done
-            left = f" · about {int(remain // 60)} min {int(remain % 60)} s left"
-        self.bar.setFormat(f"{done:,} of {total:,} · {engine.human_size(rate)}/s{left}")
+    def _progress(self, p: dict):
+        # the time left comes from how fast the last minute went (by size, not by file count), and
+        # isn't shown for the first few seconds while the drives get going
+        if p["phase"] != self._eta_phase:
+            self._eta_phase, self._eta = p["phase"], engine.Eta()
+        done, total = p["done"], p["total"]
+        self.bar.setRange(0, 1000)
+        self.bar.setValue(int(1000 * p["work_done"] / max(1, p["work_total"])) if done < total else 1000)
+        secs = p["active_s"]
+        est = self._eta.update(secs, p["work_done"], p["work_total"])
+        speed = f" · {engine.human_size(p['read_bytes'] / secs)}/s" if secs >= engine.Eta.WARMUP_S else ""
+        left = f" · {engine.format_left(est)}" if done < total else ""
+        what = "Final check: " if p["phase"] == "check" else ""
+        self.bar.setFormat(f"{what}{done:,} of {total:,} files{speed}{left}")
 
     def toggle_pause(self):
         c = self.copier
@@ -1300,12 +1432,10 @@ class MainWindow(QMainWindow):
             return
         c.paused = not c.paused
         if c.paused:
-            self._paused_at = time.monotonic()
             self.b_pause.setText("Resume")
             self.status.setText("Paused. Press Resume to carry on (or Stop).")
             self.bar.setFormat("Paused · " + self.bar.format())
         else:
-            self._copy_t0 += time.monotonic() - self._paused_at   # don't count the pause in the speed
             self.b_pause.setText("Pause")
             self.status.setText("Carrying on…")
 
@@ -1314,6 +1444,9 @@ class MainWindow(QMainWindow):
             self.copier.paused = False
         if self.healer:
             self.healer.stop = True
+        if self.reorg:
+            self.reorg.stop = True
+            self.status.setText("Stopping after the file being moved… (every move is complete or not started)")
         if self.copier:
             self.copier.stop = True
             self.status.setText("Stopping after the current file… (nothing half-copied is left behind)")
@@ -1324,6 +1457,7 @@ class MainWindow(QMainWindow):
         c = self.copier
         self.copier = None
         self._release_lock()
+        self._load_library_profile()
         self.b_pause.setText("Pause")
         self.bar.hide()
         self._update_buttons()
@@ -1840,9 +1974,266 @@ class MainWindow(QMainWindow):
             engine.log_error("Making a desktop shortcut", e)
             QMessageBox.warning(self, "Shortcut", f"Couldn't make the shortcut:\n\n{e}")
 
+    # ------------------------------------------------ how the library is organized
+    def _layout_boxes(self) -> dict:
+        return {"layout": self.layout_box, "raw_split": self.raw_box, "camera_videos": self.camvid_box,
+                "other_videos": self.othervid_box, "no_date": self.nodate_box}
+
+    def _load_library_profile(self, announce: bool | str = False):
+        """Find out how the library on the drive is organized (saved in its records, or worked out
+        from its folders for libraries from older versions), in the background."""
+        lib = self.dest()
+        self.lib_profile, self.lib_profile_source = None, ""
+        self._show_layout_note()
+        if not lib or not lib.exists() or self.detector:
+            return
+        w = self.detector = DetectWorker(lib, self.aliases)
+
+        def done():
+            self.detector = None
+            if self.dest() != lib:
+                return
+            self.lib_profile, self.lib_profile_source = w.profile, w.source
+            self._show_layout_note()
+            if announce:
+                self._announce_profile(w, from_menu=announce == "menu")
+        w.finished.connect(done)
+        w.start()
+
+    def _announce_profile(self, w: "DetectWorker", from_menu: bool = False):
+        if not w.profile:
+            if w.detail.get("custom"):
+                QMessageBox.information(
+                    self, "Library", f"This folder already has {w.detail['custom']:,} photos and videos, but not in "
+                    "folders Millésime makes, so they're left as they are. New files go into Photos and Videos "
+                    "here, organized by the options above, and anything identical to what's already there is "
+                    "still skipped.")
+            elif from_menu:
+                QMessageBox.information(self, "Library", "There are no photos or videos in this library yet, so "
+                                        "the options above decide how it's organized.")
+            return
+        how = engine.describe_profile(w.profile)
+        if w.source == "detected":
+            head = (f"This looks like a Millésime library from an earlier version ({w.detail['recognized']:,} "
+                    "photos and videos are in folders it makes). From its folders, it's organized like this:")
+        else:
+            head = "This library is organized like this:"
+        diff = engine.profile_diff(w.profile, engine.profile_of(self.settings))
+        if not diff:
+            QMessageBox.information(self, "Library", f"{head}\n\n{how}\n\nThat matches the options above.")
+            return
+        self._ask_layout(head + "\n\n" + how, diff, before_copy=False)
+
+    def _show_layout_note(self):
+        p = self.lib_profile
+        diff = engine.profile_diff(p, engine.profile_of(self.settings))
+        if not diff or self.copier or self.reorg:
+            self.layout_note.hide()
+            return
+        names = ", ".join(engine._OPTION_NAMES[k] for k in diff)
+        self.layout_note.setText(
+            f"The library on the drive is organized differently ({names}). New files will follow the options "
+            "above, so the library would end up mixed. "
+            "<a href='use'>Use the library's way</a> · <a href='reorg'>Reorganize the library to match…</a>")
+        self.layout_note.show()
+
+    def _layout_link(self, what: str):
+        if what == "use" and self.lib_profile:
+            self._apply_profile(self.lib_profile)
+        elif what == "reorg":
+            self.reorganize()
+
+    def _apply_profile(self, p: dict):
+        """Set the options to a library's layout."""
+        for k, box in self._layout_boxes().items():
+            if k in p:
+                box.blockSignals(True)
+                box.setCurrentIndex(max(0, box.findData(p[k])))
+                box.blockSignals(False)
+        self._options_changed()
+        self.status.setText("Options set to match how the library is organized.")
+
+    def _ask_layout(self, head: str, diff: list[str], before_copy: bool) -> bool:
+        """The library and the options differ. Returns False if copying shouldn't go ahead."""
+        mine = engine.describe_profile(engine.profile_of(self.settings), diff)
+        box = QMessageBox(QMessageBox.Question, "The library is organized differently", "", parent=self)
+        box.setText(f"{head}\n\nThe options above would put new files like this instead:\n\n{mine}")
+        box.setInformativeText("Reorganizing moves the files already in the library into the new folders "
+                               "(on the same drive: quick, nothing copied or deleted, and it can be undone).")
+        b_use = box.addButton("Use the library's way", QMessageBox.AcceptRole)
+        b_reorg = box.addButton("Reorganize the library…", QMessageBox.ActionRole)
+        b_mix = box.addButton("Copy anyway (mixed)" if before_copy else "Keep my options", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(b_use)
+        box.exec()
+        hit = box.clickedButton()
+        if hit is b_use:
+            self._apply_profile(self.lib_profile or {})
+            return True
+        if hit is b_reorg:
+            self.reorganize()
+            return False
+        if hit is b_mix:
+            self._layout_ok = engine.profile_of(self.settings)
+            return True
+        return False
+
+    def _layout_check(self) -> bool:
+        """Before copying: ask once if the options would mix a second layout into the library."""
+        mine = engine.profile_of(self.settings)
+        diff = engine.profile_diff(self.lib_profile, mine)
+        if not diff or self._layout_ok == mine:
+            return True
+        head = "This library is organized like this:\n\n" + engine.describe_profile(self.lib_profile, diff)
+        return self._ask_layout(head, diff, before_copy=True)
+
+    # ------------------------------------------------------------ reorganize
+    def reorganize(self):
+        """Move what's already in the library into the folders the current options make."""
+        if self.copier or self.healer or self.reorg or self.scanners:
+            return
+        lib = self.dest()
+        if not lib or not lib.exists():
+            QMessageBox.warning(self, APP_NAME, "Choose the library folder (and connect its drive) first.")
+            return
+        if not self._take_lock(lib):
+            return
+        self._start_reorg(ReorgWorker(lib, "plan", self.settings, self.aliases), "Working out where everything goes…")
+
+    def undo_reorganize(self):
+        if self.copier or self.healer or self.reorg:
+            return
+        lib = self.dest()
+        if not lib or not lib.exists():
+            QMessageBox.warning(self, APP_NAME, "Choose the library folder (and connect its drive) first.")
+            return
+        last = engine.last_reorganize(lib)
+        if not last:
+            QMessageBox.information(self, "Undo", "There's no reorganize to undo in this library.")
+            return
+        record, before = last
+        when = record.name[:10]
+        if QMessageBox.question(
+                self, "Undo the last reorganize",
+                f"Put every file the reorganize on {when} moved back where it was, with its old name?\n\n"
+                "Files you've moved or that have been added since stay where they are. Nothing is copied, "
+                "deleted or overwritten.") != QMessageBox.Yes:
+            return
+        if not self._take_lock(lib):
+            return
+        self._start_reorg(ReorgWorker(lib, "undo"), "Putting files back…")
+
+    def _start_reorg(self, w: ReorgWorker, text: str):
+        self.reorg = w
+        w.progress.connect(self._reorg_progress)
+        w.finished.connect(self._reorg_done)
+        self.bar.setRange(0, 0)
+        self.bar.setFormat(text)
+        self.bar.show()
+        self.status.setText(text)
+        self.layout_note.hide()
+        self._update_buttons()
+        w.start()
+
+    def _reorg_progress(self, done, total, what):
+        if total:
+            self.bar.setRange(0, total)
+            self.bar.setValue(done)
+            verb = "Moved" if self.reorg and self.reorg.job != "plan" else "Looked at"
+            self.bar.setFormat(f"{verb} {done:,} of {total:,}")
+        if what:
+            self.status.setText(what if self.reorg and self.reorg.job == "plan" else f"Moving {what}")
+
+    def _reorg_done(self):
+        w = self.reorg
+        self.reorg = None
+        self.bar.hide()
+        self._update_buttons()
+        if w.error or (w.cancelled and w.job == "plan"):
+            self._release_lock()
+            self.status.setText("Stopped." if w.cancelled else "The reorganize didn't finish.")
+            if w.error:
+                QMessageBox.warning(self, "Reorganize", f"It didn't finish:\n\n{w.error}\n\nEverything that was "
+                                    "moved was moved completely, and the records were kept in step.")
+            self._load_library_profile()
+            return
+        if w.job == "plan":
+            self._confirm_reorg(w)
+            return
+        self._release_lock()
+        r = w.result
+        verb = "put back" if w.job == "undo" else "moved"
+        msg = f"{r['moved']:,} files {verb}."
+        if r.get("folders_removed"):
+            msg += f" {r['folders_removed']:,} empty folders tidied away."
+        if r["skipped"]:
+            msg += f"\n\n{r['skipped']:,} were left where they are (something else is in their place, or they're gone)."
+        if w.cancelled:
+            msg += "\n\nStopped before the end. What was moved is complete; Tools › Undo puts it back."
+        if w.job == "undo" and r.get("before"):
+            self._apply_profile(r["before"])
+        self.status.setText(msg.replace("\n\n", "  "))
+        box = QMessageBox(QMessageBox.Information, "Reorganize" if w.job == "run" else "Undo", msg, parent=self)
+        if r["problems"]:
+            box.setDetailedText("\n".join(r["problems"][:500]))
+        box.exec()
+        self._replan()
+        self._load_library_profile()
+
+    def _confirm_reorg(self, w: ReorgWorker):
+        r = w.result
+        n = len(r["moves"])
+        stay = r["custom"] + r["renamed"] + r["mismatch"]
+        if not n:
+            self._release_lock()
+            msg = "Everything in the library is already where these options put it. Nothing to move."
+            if stay:
+                msg += f"\n\n({stay:,} photos and videos are in folders you made or renamed, and stay there.)"
+            self.status.setText(msg.split("\n")[0])
+            QMessageBox.information(self, "Reorganize", msg)
+            if self.dest():
+                engine.save_profile(self.dest(), self.settings)
+            self._load_library_profile()
+            return
+        size = sum(m["size"] for m in r["moves"])
+        folders = {m["pairs"][0][1].rpartition("/")[0] for m in r["moves"]}
+        msg = (f"{n:,} photos and videos ({engine.human_size(size)}) will move into {len(folders):,} folders, "
+               "following the options above:\n\n" + engine.describe_profile(r["settings"]))
+        notes = []
+        if r["unchanged"]:
+            notes.append(f"{r['unchanged']:,} are already in the right place")
+        if r["custom"]:
+            notes.append(f"{r['custom']:,} are in folders you made yourself and stay there")
+        if r["renamed"]:
+            notes.append(f"{r['renamed']:,} are in folders you renamed and stay there")
+        if r["mismatch"]:
+            notes.append(f"{r['mismatch']:,} have a date that doesn't match their folder (perhaps moved by hand) "
+                         "and stay there")
+        if r["renumbered"]:
+            notes.append(f"{r['renumbered']:,} get a number added because a different file with the same name "
+                         "lands in the same folder")
+        if notes:
+            msg += "\n\n" + "\n".join("• " + x for x in notes)
+        box = QMessageBox(QMessageBox.Question, "Reorganize the library", msg, parent=self)
+        box.setInformativeText("Files are moved on the same drive: nothing is copied, deleted or overwritten. "
+                               "Sidecars (.xmp) move with their photo, the library's records follow, and "
+                               "Tools › Undo the last reorganize puts everything back.")
+        sample = [f"{a}  →  {b}" for m in r["moves"][:1000] for a, b in m["pairs"][:1]]
+        box.setDetailedText("\n".join(sample) + (f"\n… and {n - 1000:,} more" if n > 1000 else ""))
+        b_go = box.addButton(f"Move {n:,} files", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        if box.clickedButton() is not b_go:
+            self._release_lock()
+            self.status.setText("Reorganize cancelled. Nothing was moved.")
+            self._show_layout_note()
+            return
+        before = self.lib_profile
+        self._start_reorg(ReorgWorker(w.lib, "run", the_plan=r, before=before), "Moving files…")
+
     # ----------------------------------------------------------- health check
     def health_check(self):
-        if self.copier or self.healer:
+        if self.copier or self.healer or self.reorg:
             return
         lib = self.dest()
         if not lib or not lib.exists():
@@ -1917,7 +2308,7 @@ class MainWindow(QMainWindow):
             open_path(r["report"])
 
     def _update_buttons(self):
-        busy = bool(self.copier) or bool(self.healer)
+        busy = bool(self.copier) or bool(self.healer) or bool(self.reorg)
         scanning = bool(self.scanners)
         waiting = any(it.status in ("Waiting", "Error") for it in self.model.items)
         self.b_start.setEnabled(not busy and not scanning and waiting)
@@ -1946,6 +2337,9 @@ class MainWindow(QMainWindow):
         if self.healer:
             self.healer.stop = True
             self.healer.wait(5000)
+        if self.reorg:
+            self.reorg.stop = True
+            self.reorg.wait(15000)
         self._save_layout()
         self._release_lock()
         if self.tray:
