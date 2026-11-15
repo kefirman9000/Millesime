@@ -29,6 +29,12 @@ D:\Library\
 └── Other\                          ← "Everything else", one folder per file type (ZIP, EXE …)
 ```
 
+## Pin it to the taskbar
+
+Start Millésime, right-click its icon on the taskbar and choose **Pin to taskbar**. It pins as
+Millésime with its own icon (not Python), and clicking it starts Millésime directly.
+**File › Make a desktop shortcut** does the same for the desktop.
+
 ## How to use it
 
 1. Double-click **Start Millesime (Windows).bat** (Mac: **Start Millesime (Mac).command**).

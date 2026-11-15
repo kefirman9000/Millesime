@@ -1820,20 +1820,26 @@ class MainWindow(QMainWindow):
         import subprocess
         launcher = engine.APP_DIR / "Start Millesime (Windows).bat"
         icon = engine.APP_DIR / "icon.ico"
+        pyw = Path(sys.executable).with_name("pythonw.exe")
+        if pyw.exists():                     # start Millésime itself, not the setup .bat
+            target, args = pyw, f'"{Path(__file__).resolve()}"'
+        else:
+            target, args = launcher, ""
 
         def q(p):
             return "'" + str(p).replace("'", "''") + "'"
         ps = ("$d=[Environment]::GetFolderPath('Desktop');"
               "$s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'Millesime.lnk'));"
-              f"$s.TargetPath={q(launcher)};$s.WorkingDirectory={q(engine.APP_DIR)};"
-              f"$s.IconLocation={q(icon)};$s.WindowStyle=7;"
+              f"$s.TargetPath={q(target)};$s.Arguments={q(args)};"
+              f"$s.WorkingDirectory={q(engine.APP_DIR)};"
+              f"$s.IconLocation={q(icon)};$s.WindowStyle={1 if target == pyw else 7};"
               "$s.Description='Sort cards and old drives onto a new drive';$s.Save()")
         try:
             r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                                capture_output=True, text=True, timeout=30,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if r.returncode == 0:
-                QMessageBox.information(self, "Shortcut", "A Millesime shortcut is now on your desktop.")
+                QMessageBox.information(self, "Shortcut", "A Millesime shortcut is now on your desktop.\n\nTo put it on the taskbar: with Millésime open, right-click its icon on the taskbar › Pin to taskbar.")
             else:
                 raise RuntimeError((r.stderr or r.stdout or "").strip() or "PowerShell refused")
         except Exception as e:
@@ -2050,11 +2056,71 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
 
+APP_ID = "kefirman9000.millesime"
+
+
+def set_taskbar_identity(hwnd: int) -> None:
+    """Tell Windows this window is Millésime (not Python): name, icon, and how to start it again, so
+    "Pin to taskbar" pins Millésime itself."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        import uuid
+        from ctypes import POINTER, Structure, WINFUNCTYPE, byref, c_ubyte, c_ulong, c_ushort, c_void_p
+
+        class GUID(Structure):
+            _fields_ = [("d1", c_ulong), ("d2", c_ushort), ("d3", c_ushort), ("d4", c_ubyte * 8)]
+
+        class PROPERTYKEY(Structure):
+            _fields_ = [("fmtid", GUID), ("pid", c_ulong)]
+
+        class PROPVARIANT(Structure):
+            _fields_ = [("vt", c_ushort), ("r1", c_ushort), ("r2", c_ushort), ("r3", c_ushort),
+                        ("val", c_void_p), ("pad", c_void_p)]
+
+        def guid(t):
+            return GUID.from_buffer_copy(uuid.UUID(t).bytes_le)
+
+        fmt = "{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}"     # System.AppUserModel.*
+        exe = Path(sys.executable)
+        pyw = exe.with_name("pythonw.exe")
+        if not pyw.exists():
+            pyw = exe
+        script = Path(__file__).resolve()
+        icon = engine.APP_DIR / "icon.ico"
+        values = [(2, f'"{pyw}" "{script}"'),           # RelaunchCommand
+                  (4, "Millésime"),                     # RelaunchDisplayNameResource
+                  (5, APP_ID)]                          # ID
+        if icon.exists():
+            values.insert(1, (3, f"{icon},0"))          # RelaunchIconResource
+
+        store = c_void_p()
+        ctypes.windll.shell32.SHGetPropertyStoreForWindow(
+            c_void_p(hwnd), byref(guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}")), byref(store))
+        if not store:
+            return
+        vtbl = ctypes.cast(store, POINTER(POINTER(c_void_p)))[0]
+        set_value = WINFUNCTYPE(ctypes.HRESULT, c_void_p, POINTER(PROPERTYKEY), POINTER(PROPVARIANT))(vtbl[6])
+        commit = WINFUNCTYPE(ctypes.HRESULT, c_void_p)(vtbl[7])
+        release = WINFUNCTYPE(c_ulong, c_void_p)(vtbl[2])
+        try:
+            for pid, text in values:
+                buf = ctypes.create_unicode_buffer(text)
+                pv = PROPVARIANT(vt=31, val=ctypes.cast(buf, c_void_p))   # VT_LPWSTR
+                set_value(store, byref(PROPERTYKEY(guid(fmt), pid)), byref(pv))
+            commit(store)
+        finally:
+            release(store)
+    except Exception as e:
+        engine.log_error("Setting the taskbar icon", e)
+
+
 def main():
     if os.name == "nt":
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("kefirman9000.millesime")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
         except Exception:
             pass
     engine.enable_crash_log()
@@ -2081,6 +2147,7 @@ def main():
         pass
     w = MainWindow()
     w.show()
+    set_taskbar_identity(int(w.winId()))
     sys.exit(app.exec())
 
 
